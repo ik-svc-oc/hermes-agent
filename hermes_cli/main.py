@@ -6560,6 +6560,78 @@ def cmd_update(args):
         _finalize_update_output(_update_io_state)
 
 
+def _spawn_gateway_mode_manual_restart(killed_pids: set[int]) -> bool:
+    """Start a replacement manual gateway after a gateway-launched update.
+
+    ``hermes update --gateway`` is launched from an existing gateway session,
+    often by a Telegram /update command.  If there is no active service
+    manager, the update path can only stop the old manual gateway process; it
+    cannot tell the user to run ``hermes gateway run`` because the messaging
+    channel was just stopped.  This detached helper waits for the old gateway
+    PIDs to exit, then starts a fresh manual gateway with ``--replace``.
+    """
+    pids = sorted(pid for pid in killed_pids if pid > 0)
+    if not pids:
+        return False
+
+    import shlex
+
+    logs_dir = get_hermes_home() / "logs"
+    try:
+        logs_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    log_path = logs_dir / "gateway.manual.log"
+
+    wait_parts = [
+        f"while kill -0 {pid} 2>/dev/null; do sleep 0.2; done"
+        for pid in pids
+    ]
+    gateway_cmd = " ".join(
+        shlex.quote(part)
+        for part in [
+            sys.executable,
+            "-m",
+            "hermes_cli.main",
+            "gateway",
+            "run",
+            "--replace",
+        ]
+    )
+    shell_cmd = (
+        f"cd {shlex.quote(str(PROJECT_ROOT))} || exit 126; "
+        + "; ".join(wait_parts)
+        + f"; exec {gateway_cmd} >> {shlex.quote(str(log_path))} 2>&1"
+    )
+
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    try:
+        setsid_bin = shutil.which("setsid")
+        if setsid_bin:
+            subprocess.Popen(
+                [setsid_bin, "bash", "-lc", shell_cmd],
+                cwd=PROJECT_ROOT,
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        else:
+            subprocess.Popen(
+                ["bash", "-lc", shell_cmd],
+                cwd=PROJECT_ROOT,
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        return True
+    except Exception as exc:
+        print(f"  ⚠ Failed to start replacement gateway: {exc}")
+        return False
+
+
 def _cmd_update_impl(args, gateway_mode: bool):
     """Body of ``cmd_update`` — kept separate so the wrapper can always
     restore stdio even on ``sys.exit``."""
@@ -7338,12 +7410,18 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     print(f"  ✓ Restarted {svc}")
                 if killed_pids:
                     print(f"  → Stopped {len(killed_pids)} manual gateway process(es)")
-                    print("    Restart manually: hermes gateway run")
-                    # Also restart for each profile if needed
-                    if len(killed_pids) > 1:
-                        print(
-                            "    (or: hermes -p <profile> gateway run  for each profile)"
-                        )
+                    if gateway_mode and not restarted_services:
+                        if _spawn_gateway_mode_manual_restart(killed_pids):
+                            print("    Replacement gateway will start automatically")
+                        else:
+                            print("    Restart manually: hermes gateway run")
+                    else:
+                        print("    Restart manually: hermes gateway run")
+                        # Also restart for each profile if needed
+                        if len(killed_pids) > 1:
+                            print(
+                                "    (or: hermes -p <profile> gateway run  for each profile)"
+                            )
 
             if not restarted_services and not killed_pids:
                 # No gateways were running — nothing to do
