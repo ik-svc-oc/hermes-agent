@@ -762,6 +762,36 @@ class TestInit:
             )
             assert a.valid_tool_names == {"web_search", "terminal"}
 
+    def test_tool_publication_audit_warns_when_terminal_is_omitted(self):
+        """Resolved terminal toolsets should warn if terminal is not published."""
+        tools = _make_tool_defs("process")
+        with (
+            patch("run_agent.get_tool_definitions", return_value=tools),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch("toolsets.resolve_toolset", return_value=["terminal", "process"]),
+            patch(
+                "tools.terminal_tool.get_terminal_backend_status",
+                return_value={"healthy": True, "env_type": "local", "reason": ""},
+            ),
+            patch("run_agent.logger.warning") as mock_warning,
+        ):
+            AIAgent(
+                api_key="test-key-1234567890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+                enabled_toolsets=["terminal"],
+                platform="telegram",
+                session_id="sess-123",
+            )
+
+        assert any(
+            "Terminal tool publication mismatch" in call.args[0]
+            for call in mock_warning.call_args_list
+        )
+
     def test_session_id_auto_generated(self):
         """Session ID should be auto-generated in YYYYMMDD_HHMMSS_<hex6> format."""
         with (

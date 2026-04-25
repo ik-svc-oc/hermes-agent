@@ -114,3 +114,14 @@ class TestTerminalRequirements:
 
         assert "terminal" not in names
         assert "execute_code" not in names
+
+    def test_terminal_tool_stays_published_when_backend_is_unhealthy(self, monkeypatch):
+        monkeypatch.setattr(
+            terminal_tool_module,
+            "_get_env_config",
+            lambda: {"env_type": "unknown-backend"},
+        )
+        tools = get_tool_definitions(enabled_toolsets=["terminal"], quiet_mode=True)
+        names = {tool["function"]["name"] for tool in tools}
+
+        assert names == {"process", "terminal"}

@@ -928,6 +928,23 @@ def _build_child_agent(
     if effective_role == "orchestrator" and "delegation" not in child_toolsets:
         child_toolsets.append("delegation")
 
+    _requested_toolsets = list(toolsets) if toolsets else None
+    _requested_set = set(_requested_toolsets or (parent_enabled or sorted(parent_toolsets) or DEFAULT_TOOLSETS))
+    _dropped_not_on_parent = sorted(
+        set(_requested_toolsets or []) - set(parent_toolsets)
+    )
+    _blocked_for_child = sorted(
+        _requested_set - set(child_toolsets) - set(_dropped_not_on_parent)
+    )
+    logger.info(
+        "Delegation toolset scope: parent_toolsets=%s requested_toolsets=%s child_toolsets=%s dropped_not_on_parent=%s blocked_for_child=%s",
+        sorted(parent_toolsets),
+        _requested_toolsets,
+        child_toolsets,
+        _dropped_not_on_parent,
+        _blocked_for_child,
+    )
+
     workspace_hint = _resolve_workspace_hint(parent_agent)
     child_prompt = _build_child_system_prompt(
         goal,

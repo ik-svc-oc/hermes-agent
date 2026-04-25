@@ -251,6 +251,8 @@ _MAX_BACKOFF_SECONDS = 60
 # Environment variables that are safe to pass to stdio subprocesses
 _SAFE_ENV_KEYS = frozenset({
     "PATH", "HOME", "USER", "LANG", "LC_ALL", "TERM", "SHELL", "TMPDIR",
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+    "http_proxy", "https_proxy", "all_proxy", "no_proxy",
 })
 
 # Regex for credential patterns to strip from error messages
@@ -268,10 +270,32 @@ _CREDENTIAL_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Regex for shell-style env var placeholders like $VAR or ${VAR}
+_ENV_PLACEHOLDER_PATTERN = re.compile(
+    r"\$(?:\{(?P<braced>[A-Za-z_][A-Za-z0-9_]*)\}|(?P<plain>[A-Za-z_][A-Za-z0-9_]*))"
+)
+
 
 # ---------------------------------------------------------------------------
 # Security helpers
 # ---------------------------------------------------------------------------
+
+def _expand_env_placeholders(value: Any) -> Any:
+    """Expand shell-style env placeholders in config-provided values.
+
+    Supports both ``$VAR`` and ``${VAR}`` forms. Unknown variables are left
+    unchanged so misconfiguration remains visible instead of silently becoming
+    an empty string.
+    """
+    if not isinstance(value, str):
+        return value
+
+    def _replace(match: re.Match[str]) -> str:
+        var_name = match.group("braced") or match.group("plain")
+        return os.environ.get(var_name, match.group(0))
+
+    return _ENV_PLACEHOLDER_PATTERN.sub(_replace, value)
+
 
 def _build_safe_env(user_env: Optional[dict]) -> dict:
     """Build a filtered environment dict for stdio subprocesses.
@@ -288,7 +312,7 @@ def _build_safe_env(user_env: Optional[dict]) -> dict:
         if key in _SAFE_ENV_KEYS or key.startswith("XDG_"):
             env[key] = value
     if user_env:
-        env.update(user_env)
+        env.update({key: _expand_env_placeholders(value) for key, value in user_env.items()})
     return env
 
 

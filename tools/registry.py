@@ -25,6 +25,11 @@ from typing import Callable, Dict, List, Optional, Set
 
 logger = logging.getLogger(__name__)
 
+# Some tools should remain advertised even when their backend-health check is
+# currently failing. This lets the agent surface a runtime health error instead
+# of silently losing the tool from the published schema.
+_ALWAYS_ADVERTISED_TOOL_NAMES = frozenset({"terminal"})
+
 
 def _is_registry_register_call(node: ast.AST) -> bool:
     """Return True when *node* is a ``registry.register(...)`` call expression."""
@@ -328,7 +333,7 @@ class ToolRegistry:
             entry = entries_by_name.get(name)
             if not entry:
                 continue
-            if entry.check_fn:
+            if entry.check_fn and entry.name not in _ALWAYS_ADVERTISED_TOOL_NAMES:
                 if entry.check_fn not in check_results:
                     check_results[entry.check_fn] = _check_fn_cached(entry.check_fn)
                 if not check_results[entry.check_fn]:

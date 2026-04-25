@@ -8,8 +8,9 @@ arbitrary toolsets.
 
 from unittest.mock import MagicMock, patch
 from types import SimpleNamespace
+import logging
 
-from tools.delegate_tool import _strip_blocked_tools
+from tools.delegate_tool import _build_child_agent, _strip_blocked_tools
 
 
 class TestToolsetIntersection:
@@ -64,3 +65,39 @@ class TestToolsetIntersection:
         scoped = [t for t in requested if t in parent_toolsets]
 
         assert scoped == []
+
+    def test_build_child_agent_logs_why_requested_toolset_was_dropped(self, caplog):
+        parent = SimpleNamespace(
+            enabled_toolsets=["file"],
+            valid_tool_names={"read_file"},
+            model="test-model",
+            api_key="test-key",
+            base_url="https://example.com/v1",
+            platform="telegram",
+            providers_allowed=None,
+            providers_ignored=None,
+            providers_order=None,
+            provider_sort=None,
+            session_id="parent-session",
+        )
+
+        with (
+            patch("run_agent.AIAgent", return_value=MagicMock()),
+            caplog.at_level(logging.INFO),
+        ):
+            _build_child_agent(
+                task_index=1,
+                goal="Check logs",
+                context=None,
+                toolsets=["terminal"],
+                model=None,
+                max_iterations=5,
+                task_count=1,
+                parent_agent=parent,
+            )
+
+        assert any(
+            "Delegation toolset scope:" in record.getMessage()
+            and "dropped_not_on_parent=['terminal']" in record.getMessage()
+            for record in caplog.records
+        )

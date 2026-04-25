@@ -83,6 +83,40 @@ class TestLoadMCPConfig:
             assert result == {}
 
 
+class TestBuildSafeEnv:
+    def test_preserves_proxy_env_from_parent_process(self, monkeypatch):
+        monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:7897")
+        monkeypatch.setenv("NO_PROXY", "localhost,127.0.0.1")
+
+        from tools.mcp_tool import _build_safe_env
+
+        env = _build_safe_env({})
+
+        assert env["HTTPS_PROXY"] == "http://127.0.0.1:7897"
+        assert env["NO_PROXY"] == "localhost,127.0.0.1"
+
+    def test_expands_shell_style_placeholders_in_user_env(self, monkeypatch):
+        monkeypatch.setenv("GRAFANA_URL", "https://grafana.example.com")
+        monkeypatch.setenv("GRAFANA_SERVICE_ACCOUNT_TOKEN", "glsa_test_token")
+
+        from tools.mcp_tool import _build_safe_env
+
+        env = _build_safe_env({
+            "GRAFANA_URL": "${GRAFANA_URL}",
+            "GRAFANA_SERVICE_ACCOUNT_TOKEN": "$GRAFANA_SERVICE_ACCOUNT_TOKEN",
+        })
+
+        assert env["GRAFANA_URL"] == "https://grafana.example.com"
+        assert env["GRAFANA_SERVICE_ACCOUNT_TOKEN"] == "glsa_test_token"
+
+    def test_unknown_placeholders_are_left_visible(self):
+        from tools.mcp_tool import _build_safe_env
+
+        env = _build_safe_env({"GRAFANA_URL": "${MISSING_GRAFANA_URL}"})
+
+        assert env["GRAFANA_URL"] == "${MISSING_GRAFANA_URL}"
+
+
 # ---------------------------------------------------------------------------
 # Schema conversion
 # ---------------------------------------------------------------------------

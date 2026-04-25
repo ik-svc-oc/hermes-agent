@@ -1590,6 +1590,67 @@ class AIAgent:
             timestamp_str = self.session_start.strftime("%Y%m%d_%H%M%S")
             short_uuid = uuid.uuid4().hex[:6]
             self.session_id = f"{timestamp_str}_{short_uuid}"
+
+        # Keep separate visibility into requested toolsets, published tool
+        # schemas, and backend readiness. Gateway debugging depends on being
+        # able to tell "tool not advertised" apart from "tool advertised but
+        # unhealthy at runtime".
+        self._resolved_enabled_tool_names: set[str] = set()
+        self._published_tool_names: set[str] = set(self.valid_tool_names)
+        self._tool_publication_omissions: set[str] = set()
+        self._terminal_backend_healthy: Optional[bool] = None
+        if enabled_toolsets is not None:
+            try:
+                from toolsets import resolve_toolset
+
+                for _toolset_name in enabled_toolsets:
+                    self._resolved_enabled_tool_names.update(resolve_toolset(_toolset_name))
+
+                self._tool_publication_omissions = (
+                    self._resolved_enabled_tool_names - self._published_tool_names
+                )
+                logger.info(
+                    "Tool publication: platform=%s session=%s enabled_toolsets=%s published_tools=%s omitted_tools=%s",
+                    self.platform or "cli",
+                    self.session_id,
+                    sorted(enabled_toolsets),
+                    sorted(self._published_tool_names),
+                    sorted(self._tool_publication_omissions),
+                )
+
+                if {"terminal", "process"} & self._resolved_enabled_tool_names:
+                    try:
+                        from tools.terminal_tool import get_terminal_backend_status
+
+                        self._terminal_backend_healthy = bool(
+                            get_terminal_backend_status(log_failures=False).get("healthy")
+                        )
+                    except Exception as exc:
+                        logger.debug("Terminal backend audit failed: %s", exc)
+
+                    _missing_terminal_surface = sorted(
+                        {"terminal", "process"} - self._published_tool_names
+                    )
+                    if _missing_terminal_surface:
+                        logger.warning(
+                            "Terminal tool publication mismatch: platform=%s session=%s enabled_toolsets=%s missing_tools=%s published_tools=%s terminal_backend_healthy=%s",
+                            self.platform or "cli",
+                            self.session_id,
+                            sorted(enabled_toolsets),
+                            _missing_terminal_surface,
+                            sorted(self._published_tool_names),
+                            self._terminal_backend_healthy,
+                        )
+                    elif self._terminal_backend_healthy is False:
+                        logger.warning(
+                            "Terminal backend unhealthy but still advertised: platform=%s session=%s enabled_toolsets=%s published_tools=%s",
+                            self.platform or "cli",
+                            self.session_id,
+                            sorted(enabled_toolsets),
+                            sorted(self._published_tool_names),
+                        )
+            except Exception as exc:
+                logger.debug("Tool publication audit skipped: %s", exc)
         
         # Session logs go into ~/.hermes/sessions/ alongside gateway sessions
         hermes_home = get_hermes_home()
