@@ -286,11 +286,10 @@ _ANTHROPIC_DEFAULT_BASE_URL = "https://api.anthropic.com"
 _AUTH_JSON_PATH = get_hermes_home() / "auth.json"
 
 # Codex fallback: uses the Responses API (the only endpoint the Codex
-# OAuth token can access) with a fast model for auxiliary tasks.
-# ChatGPT-backed Codex accounts currently reject gpt-5.3-codex for these
-# auxiliary flows, while gpt-5.2-codex remains broadly available and supports
-# vision via Responses.
-_CODEX_AUX_MODEL = "gpt-5.2-codex"
+# OAuth token can access) with the same ChatGPT-account model family as the
+# primary agent.  ChatGPT-backed Codex accounts reject older codex-only model
+# names such as gpt-5.2-codex for these auxiliary flows.
+_CODEX_AUX_MODEL = "gpt-5.5"
 _CODEX_AUX_BASE_URL = "https://chatgpt.com/backend-api/codex"
 
 

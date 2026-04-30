@@ -272,7 +272,7 @@ class TestTryCodex:
             client, model = _try_codex()
 
         assert client is not None
-        assert model == "gpt-5.2-codex"
+        assert model == "gpt-5.5"
         assert mock_openai.call_args.kwargs["api_key"] == "codex-auth-token"
         assert mock_openai.call_args.kwargs["base_url"] == "https://chatgpt.com/backend-api/codex"
 
@@ -514,7 +514,7 @@ class TestGetTextAuxiliaryClient:
         from agent.auxiliary_client import CodexAuxiliaryClient
 
         assert isinstance(client, CodexAuxiliaryClient)
-        assert model == "gpt-5.2-codex"
+        assert model == "gpt-5.5"
 
     def test_returns_none_when_nothing_available(self, monkeypatch):
         monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
@@ -836,11 +836,11 @@ class TestTryPaymentFallback:
         with patch("agent.auxiliary_client._try_openrouter", return_value=(None, None)), \
              patch("agent.auxiliary_client._try_nous", return_value=(None, None)), \
              patch("agent.auxiliary_client._try_custom_endpoint", return_value=(None, None)), \
-             patch("agent.auxiliary_client._try_codex", return_value=(mock_codex, "gpt-5.2-codex")), \
+             patch("agent.auxiliary_client._try_codex", return_value=(mock_codex, "gpt-5.5")), \
              patch("agent.auxiliary_client._read_main_provider", return_value="openrouter"):
             client, model, label = _try_payment_fallback("openrouter")
         assert client is mock_codex
-        assert model == "gpt-5.2-codex"
+        assert model == "gpt-5.5"
         assert label == "openai-codex"
 
 
