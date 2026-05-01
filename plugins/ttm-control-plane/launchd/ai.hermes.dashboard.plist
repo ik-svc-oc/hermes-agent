@@ -29,7 +29,7 @@
         <string>-m</string>
         <string>hermes_cli.main</string>
         <string>dashboard</string>
-        <string>--no-browser</string>
+        <string>--no-open</string>
         <string>--port</string>
         <string>9119</string>
     </array>

@@ -23,8 +23,6 @@ the dispatch body and MUST be forwarded as ``Authorization: Bearer
 in plugin logs or in the runtime registry.
 """
 
-from __future__ import annotations
-
 import asyncio
 import logging
 import os
