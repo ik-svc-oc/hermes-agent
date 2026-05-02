@@ -1,15 +1,20 @@
 """TTM control-plane spawn-shim API.
 
-PR-F-H1 of the Hermes alignment plan. Mounts under
-``/api/plugins/ttm-control-plane/`` on the Hermes dashboard FastAPI app.
+PR-F-H1 of the Hermes alignment plan, with H1's two deferred items
+(``_spawn_headless_session`` real subprocess + SQLite binding
+registry) landed in PR-F-H3 closeout. Mounts under
+``/api/plugins/ttm-control-plane/`` on the Hermes dashboard FastAPI
+app.
 
 This is the HTTP face that TTM's ``HermesAdapter.dispatch_run()`` calls:
 TTM POSTs the runtime dispatch payload (carrying the per-run principal
 token), Hermes validates the payload, binds the run to a runtime
 session, and returns 202 ``{status: "accepted", runtime_run_ref}``.
-The actual headless agent session-start is deferred to a follow-up
-(see ``_spawn_headless_session``); this PR locks the wire contract
-and idempotency so TTM dispatches stop degrading.
+A headless ``hermes chat`` subprocess is then spawned with the run's
+TTM_* env vars so the agent can drive the run via the ttm_ingress
+skill. The binding registry is SQLite-backed so dispatched runs
+survive dashboard restarts (the principal token is the one piece of
+binding state that is NOT persisted — see ``_BindingRegistry``).
 
 Auth model: shared-secret header ``X-TTM-Control-Plane-Secret`` whose
 value matches the ``TTM_CONTROL_PLANE_SECRET`` environment variable
@@ -24,12 +29,16 @@ in plugin logs or in the runtime registry.
 """
 
 import asyncio
+import json
 import logging
 import os
+import shutil
+import sqlite3
 import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -86,28 +95,111 @@ class _RuntimeBinding:
     runtime_run_ref: str
     ingress_base_url: str
     bound_at: datetime
-    # ``principal_token`` is held only as long as we need it to fire the
-    # ``run.dispatched`` ingress callback. It is NOT persisted to disk,
-    # NOT logged, and is dropped from this struct once the callback
-    # succeeds. A subsequent reconciliation flow (out of scope for
-    # PR-F-H1) will re-fetch tokens via TTM's token-refresh path if
-    # needed.
+    # ``principal_token`` is held in memory only — never persisted to SQLite
+    # and never logged. After the run.dispatched callback fires, the token
+    # is cleared; the headless agent process holds its own copy via the
+    # TTM_PRINCIPAL_TOKEN env var passed at spawn time.
     principal_token: str = ""
     last_status: str = "pending"
     payload_summary: dict[str, Any] = field(default_factory=dict)
 
 
-class _BindingRegistry:
-    """Thread-safe ``run_id → _RuntimeBinding`` registry.
+_DEFAULT_DB_PATH = os.path.expanduser(
+    os.environ.get("TTM_CONTROL_PLANE_DB_PATH", "~/.hermes/state.db")
+)
+_DB_TABLE = "ttm_control_plane_bindings"
 
-    Lives for the lifetime of the dashboard process. Idempotency rule:
-    a re-dispatch against an already-bound ``run_id`` returns 409 from
-    the route layer; the registry never overwrites an existing entry.
+
+class _BindingRegistry:
+    """Thread-safe ``run_id → _RuntimeBinding`` registry with SQLite persistence.
+
+    Binding metadata persists across dashboard restarts so:
+    1. re-dispatch against a known run_id is idempotent (returns 409),
+    2. operators can inspect prior dispatches via /health and snapshot,
+    3. a rebind picks up the existing binding and just rotates the token.
+
+    The principal token is NOT persisted — it lives only in memory and
+    is cleared after the run.dispatched callback fires. After a restart
+    the registry's tokens are empty; the operator must trigger a rebind
+    (POST /api/runs/control-plane/{run_id}/rebind on TTM) to issue a
+    fresh token, which TTM forwards via /runs/{run_id}/rebind-token.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, db_path: str | None = None) -> None:
         self._lock = threading.Lock()
         self._by_run: dict[str, _RuntimeBinding] = {}
+        self._db_path = db_path or _DEFAULT_DB_PATH
+        self._init_db()
+        self._load_from_db()
+
+    def _connect(self) -> sqlite3.Connection:
+        Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(self._db_path, isolation_level=None)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        return conn
+
+    def _init_db(self) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {_DB_TABLE} (
+                    run_id TEXT PRIMARY KEY,
+                    runtime_binding_id TEXT NOT NULL,
+                    runtime_run_ref TEXT NOT NULL,
+                    ingress_base_url TEXT NOT NULL,
+                    bound_at TEXT NOT NULL,
+                    last_status TEXT NOT NULL,
+                    payload_summary_json TEXT NOT NULL
+                )
+                """
+            )
+
+    def _load_from_db(self) -> None:
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT run_id, runtime_binding_id, runtime_run_ref, "
+                f"ingress_base_url, bound_at, last_status, payload_summary_json "
+                f"FROM {_DB_TABLE}"
+            ).fetchall()
+        for row in rows:
+            self._by_run[row[0]] = _RuntimeBinding(
+                run_id=row[0],
+                runtime_binding_id=row[1],
+                runtime_run_ref=row[2],
+                ingress_base_url=row[3],
+                bound_at=datetime.fromisoformat(row[4]),
+                principal_token="",  # never persisted
+                last_status=row[5],
+                payload_summary=json.loads(row[6]) if row[6] else {},
+            )
+
+    def _persist(self, binding: _RuntimeBinding) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                f"""
+                INSERT INTO {_DB_TABLE}
+                  (run_id, runtime_binding_id, runtime_run_ref, ingress_base_url,
+                   bound_at, last_status, payload_summary_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(run_id) DO UPDATE SET
+                  runtime_binding_id=excluded.runtime_binding_id,
+                  runtime_run_ref=excluded.runtime_run_ref,
+                  ingress_base_url=excluded.ingress_base_url,
+                  bound_at=excluded.bound_at,
+                  last_status=excluded.last_status,
+                  payload_summary_json=excluded.payload_summary_json
+                """,
+                (
+                    binding.run_id,
+                    binding.runtime_binding_id,
+                    binding.runtime_run_ref,
+                    binding.ingress_base_url,
+                    binding.bound_at.isoformat(),
+                    binding.last_status,
+                    json.dumps(binding.payload_summary),
+                ),
+            )
 
     def get(self, run_id: str) -> _RuntimeBinding | None:
         with self._lock:
@@ -119,19 +211,23 @@ class _BindingRegistry:
             if existing is not None:
                 return existing
             self._by_run[binding.run_id] = binding
+            self._persist(binding)
             return binding
 
     def update_status(self, run_id: str, *, last_status: str) -> None:
         with self._lock:
             entry = self._by_run.get(run_id)
-            if entry is not None:
-                entry.last_status = last_status
+            if entry is None:
+                return
+            entry.last_status = last_status
+            self._persist(entry)
 
     def clear_token(self, run_id: str) -> None:
         with self._lock:
             entry = self._by_run.get(run_id)
             if entry is not None:
                 entry.principal_token = ""
+        # No DB write — token is never persisted.
 
     def replace_token(self, run_id: str, new_token: str) -> bool:
         """Atomically replace the principal token; returns True if binding found."""
@@ -145,10 +241,19 @@ class _BindingRegistry:
     def remove(self, run_id: str) -> None:
         with self._lock:
             self._by_run.pop(run_id, None)
+            with self._connect() as conn:
+                conn.execute(f"DELETE FROM {_DB_TABLE} WHERE run_id = ?", (run_id,))
 
     def snapshot(self) -> list[_RuntimeBinding]:
         with self._lock:
             return list(self._by_run.values())
+
+    def clear(self) -> None:
+        """Wipe both in-memory and persistent state. Test-only."""
+        with self._lock:
+            self._by_run.clear()
+            with self._connect() as conn:
+                conn.execute(f"DELETE FROM {_DB_TABLE}")
 
 
 _REGISTRY = _BindingRegistry()
@@ -315,28 +420,142 @@ async def _post_run_dispatched(binding: _RuntimeBinding) -> None:
         _REGISTRY.clear_token(binding.run_id)
 
 
-async def _spawn_headless_session(binding: _RuntimeBinding) -> None:
-    """Best-effort headless agent spawn.
+_SPAWN_LOG_DIR = os.path.expanduser(
+    os.environ.get("TTM_CONTROL_PLANE_LOG_DIR", "~/.hermes/logs/runs")
+)
+_SPAWN_DISABLED_ENV = "TTM_CONTROL_PLANE_DISABLE_SPAWN"
 
-    PR-F-H1 stub: logs the intent. The actual ``hermes chat --headless
-    --session-id <run_id>`` subprocess (or in-process equivalent) is
-    landed in a follow-up so the plugin contract can be reviewed
-    independently of the agent-runtime spawn pathway.
+
+def _hermes_executable() -> str | None:
+    """Resolve the hermes CLI binary.
+
+    Prefers ``HERMES_CLI`` env, then PATH lookup, then a fallback to the
+    venv that the dashboard itself is running in. Returns ``None`` if
+    none of those resolve so the caller can log-and-skip cleanly.
     """
+    explicit = os.environ.get("HERMES_CLI", "").strip()
+    if explicit and Path(explicit).exists():
+        return explicit
+    found = shutil.which("hermes")
+    if found:
+        return found
+    # Fall back to the same venv the dashboard process is using.
+    candidate = Path(os.path.dirname(os.path.dirname(os.__file__))).parent / "bin" / "hermes"
+    if candidate.exists():
+        return str(candidate)
+    return None
+
+
+async def _spawn_headless_session(binding: _RuntimeBinding, principal_token: str) -> None:
+    """Spawn a headless Hermes session bound to the dispatched run.
+
+    The child receives the principal token and ingress base URL via env
+    vars (see ``tools/ttm_ingress.py:bind_run_from_env``). Failure to
+    spawn is logged but never crashes the dispatch — the operator can
+    inspect ``ttm-control-plane.headless_session.*`` log lines and
+    re-dispatch or rebind if the pathway is misconfigured.
+
+    The child is intentionally NOT awaited: the dispatch route already
+    returned 202 and the agent runs for the lifetime of the run.
+    """
+    if os.environ.get(_SPAWN_DISABLED_ENV, "").strip().lower() in {"1", "true", "yes"}:
+        logger.info(
+            "ttm-control-plane.headless_session.disabled run_id=%s "
+            "(TTM_CONTROL_PLANE_DISABLE_SPAWN set; binding registered without spawn)",
+            binding.run_id,
+        )
+        return
+
+    hermes_bin = _hermes_executable()
+    if hermes_bin is None:
+        logger.warning(
+            "ttm-control-plane.headless_session.no_executable run_id=%s "
+            "(set HERMES_CLI or add hermes to PATH; binding remains registered)",
+            binding.run_id,
+        )
+        return
+
+    if not principal_token:
+        logger.warning(
+            "ttm-control-plane.headless_session.no_token run_id=%s "
+            "(token already cleared; cannot spawn)",
+            binding.run_id,
+        )
+        return
+
+    base = (binding.ingress_base_url or "").rstrip("/")
+    if not base:
+        logger.warning(
+            "ttm-control-plane.headless_session.no_ingress run_id=%s "
+            "(ingress_base_url unset; cannot spawn)",
+            binding.run_id,
+        )
+        return
+
+    Path(_SPAWN_LOG_DIR).mkdir(parents=True, exist_ok=True)
+    log_path = Path(_SPAWN_LOG_DIR) / f"{binding.run_id}.log"
+
+    env = {
+        **os.environ,
+        "TTM_RUN_ID": binding.run_id,
+        "TTM_PRINCIPAL_TOKEN": principal_token,
+        "TTM_INGRESS_BASE_URL": base,
+        "TTM_RUNTIME_ID": "hermes",
+    }
+
+    brief = (
+        f"You are Hermes executing TTM run {binding.run_id}. "
+        f"Bind via tools.ttm_ingress.bind_run_from_env(), read run state, "
+        f"drive each gate in approval_policy: post events, attach evidence, "
+        f"request approval, poll for the operator decision, and emit "
+        f"run.closed when complete. The principal token is in "
+        f"TTM_PRINCIPAL_TOKEN; never log it."
+    )
+
+    try:
+        log_file = open(log_path, "ab", buffering=0)  # noqa: SIM115 — owned by child
+        proc = await asyncio.create_subprocess_exec(
+            hermes_bin,
+            "chat",
+            "-q",
+            brief,
+            "-Q",
+            "--max-turns",
+            "200",
+            env=env,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=log_file,
+            stderr=log_file,
+            start_new_session=True,
+        )
+    except (OSError, asyncio.CancelledError) as exc:
+        logger.error(
+            "ttm-control-plane.headless_session.spawn_failed run_id=%s error=%s",
+            binding.run_id,
+            exc,
+        )
+        return
+
     logger.info(
-        "ttm-control-plane.headless_session.deferred run_id=%s "
-        "runtime_run_ref=%s — agent spawn lands in follow-up PR",
+        "ttm-control-plane.headless_session.spawned run_id=%s pid=%s log=%s",
         binding.run_id,
-        binding.runtime_run_ref,
+        proc.pid,
+        log_path,
     )
 
 
 def _kick_off_post_dispatch_tasks(binding: _RuntimeBinding) -> None:
     """Schedule the run.dispatched callback + headless spawn off the
-    request loop so the route returns 202 immediately."""
+    request loop so the route returns 202 immediately.
+
+    The principal token is captured and passed to the spawn task before
+    ``_post_run_dispatched`` clears it from the registry — this avoids a
+    race where the spawn would observe an empty token.
+    """
     loop = asyncio.get_running_loop()
+    captured_token = binding.principal_token
     loop.create_task(_post_run_dispatched(binding))
-    loop.create_task(_spawn_headless_session(binding))
+    loop.create_task(_spawn_headless_session(binding, captured_token))
 
 
 # ---------------------------------------------------------------------------

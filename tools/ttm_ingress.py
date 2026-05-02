@@ -159,17 +159,14 @@ class _IngressBinding:
     bound_at: float = field(default_factory=time.time)
 
 
-def _redact_token(token: str) -> str:
-    """Return a debug-safe prefix of the principal token.
+def _token_present(token: str) -> str:
+    """Return a fixed marker indicating whether a principal token is bound.
 
-    Eight visible chars then an ellipsis. Empty string stays empty so the
-    logger does not pretend a token was present when it was not.
+    Logging even a truncated prefix risks leakage in long-running
+    production logs (post-mortem from operator review). Emit only a
+    boolean signal — the caller already has run_id for correlation.
     """
-    if not token:
-        return ""
-    if len(token) <= 8:
-        return token[:2] + "…"
-    return token[:8] + "…"
+    return "set" if token else "unset"
 
 
 def _humanize_event(event_type: str) -> str:
@@ -248,10 +245,10 @@ class TtmIngress:
                     scope_epoch=int(initial_scope_epoch),
                 )
                 logger.debug(
-                    "ttm_ingress.bind_run run_id=%s base=%s token_prefix=%s",
+                    "ttm_ingress.bind_run run_id=%s base=%s token=%s",
                     run_id,
                     ingress_base_url,
-                    _redact_token(principal_token),
+                    _token_present(principal_token),
                 )
                 return
             existing.principal_token = principal_token
@@ -259,10 +256,10 @@ class TtmIngress:
             existing.runtime_id = runtime_id
             existing.bound_at = time.time()
             logger.debug(
-                "ttm_ingress.rebind_run run_id=%s base=%s token_prefix=%s",
+                "ttm_ingress.rebind_run run_id=%s base=%s token=%s",
                 run_id,
                 ingress_base_url,
-                _redact_token(principal_token),
+                _token_present(principal_token),
             )
 
     def bind_run_from_env(
@@ -550,7 +547,7 @@ class TtmIngress:
             "op": op,
             "run_id": binding.run_id,
             "url": url,
-            "token_prefix": _redact_token(binding.principal_token),
+            "token": _token_present(binding.principal_token),
             **(extra_log or {}),
         }
 

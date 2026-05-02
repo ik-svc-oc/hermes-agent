@@ -70,3 +70,4 @@ mini-swe-agent/
 result
 website/static/api/skills-index.json
 models-dev-upstream/
+tests/plugins/_test_ttm_control_plane.db

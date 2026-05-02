@@ -43,12 +43,15 @@ curl -s http://127.0.0.1:9119/api/plugins/ttm-control-plane/health | jq .
 
 The plist runs `hermes_cli.main dashboard --no-browser --port 9119` with `KeepAlive` on non-success and writes to `~/.hermes/logs/dashboard.{log,error.log}`.
 
-## What this PR does NOT do (deferred to follow-ups)
+## Status of original H1 deferrals
 
-- **Headless agent spawn**: `_spawn_headless_session` in `dashboard/plugin_api.py` is a logging stub. The follow-up wires `hermes chat --headless --session-id <run_id>` (or the in-process equivalent) so a real agent picks up the run.
-- **Pause / resume / retry-slice routes**: the contract surface is broader than this PR. The next PR adds them once the spawn pathway is real.
-- **Persistence**: the binding registry is in-memory. Dashboard restarts drop active bindings. Persisting to `~/.hermes/state.db` is a follow-up.
-- **TTM rebind alignment**: TTM's `POST /control-plane/{run_id}/rebind` (PR-G) still returns plaintext tokens to the operator, mirroring the deviation [TTM PR #648](https://github.com/you-kol/ttm/pull/648) corrected for dispatch. The matching rebind contract fix is a separate TTM PR.
+- **Headless agent spawn**: landed. `_spawn_headless_session` spawns `hermes chat -q ... -Q --max-turns 200` with `TTM_RUN_ID`, `TTM_PRINCIPAL_TOKEN`, `TTM_INGRESS_BASE_URL`, and `TTM_RUNTIME_ID` injected as env vars. Failure to resolve the binary or missing token logs and skips — never crashes the dispatch route. Set `TTM_CONTROL_PLANE_DISABLE_SPAWN=1` to suppress the spawn (tests/dev).
+- **Persistence**: landed. The binding registry is SQLite-backed at `~/.hermes/state.db` (override via `TTM_CONTROL_PLANE_DB_PATH`). Binding metadata survives dashboard restarts. The principal token is **never** persisted — after a restart the operator must trigger a TTM rebind to issue a fresh token, which arrives via `/runs/{run_id}/rebind-token`.
+- **TTM rebind alignment**: landed. TTM's `POST /control-plane/{run_id}/rebind` returns `token=None` in the response (operator never sees plaintext); the new token flows directly to the plugin via `notify_rebind` → `/runs/{run_id}/rebind-token`.
+
+## Still deferred (H4 and beyond)
+
+- **Pause / resume / retry-slice routes**: the plugin does not expose `/runs/{ref}/pause`, `/resume`, or `/slices/{slice_id}/retry`. TTM's `HermesAdapter` returns `unsupported` for these (PR #658) until H4 lands the matching surface. Stop is supported — `POST /runs/{ref}/stop` tears down the binding for re-dispatch.
 
 ## Tests
 
