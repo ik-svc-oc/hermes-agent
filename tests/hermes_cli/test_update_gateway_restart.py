@@ -284,6 +284,7 @@ class TestLaunchdPlistRefresh:
         """launchd_start refreshes the plist before starting."""
         plist_path = tmp_path / "ai.hermes.gateway.plist"
         plist_path.write_text("<plist>old</plist>")
+        monkeypatch.setattr(gateway_cli, "_launchd_managername", lambda: "Aqua")
         monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
 
         calls = []
@@ -305,6 +306,7 @@ class TestLaunchdPlistRefresh:
         plist_path = tmp_path / "ai.hermes.gateway.plist"
         assert not plist_path.exists()
 
+        monkeypatch.setattr(gateway_cli, "_launchd_managername", lambda: "Aqua")
         monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
 
         calls = []
@@ -893,6 +895,62 @@ class TestServicePidExclusion:
         assert len(service_kills) == 0
         # Should show manual stop message since manual PID was killed
         assert "Stopped 1 manual gateway" in captured
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_gateway_mode_update_restarts_manual_gateway(
+        self, mock_run, _mock_which, capsys, monkeypatch,
+    ):
+        """Telegram-launched updates must not leave manual gateways stopped."""
+        args = SimpleNamespace(gateway=True)
+        manual_pid = 42999
+
+        monkeypatch.setattr(gateway_cli, "is_macos", lambda: False)
+        monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: False)
+        monkeypatch.setattr(gateway_cli, "is_termux", lambda: False)
+        mock_run.side_effect = _make_run_side_effect(commit_count="3")
+
+        with patch.object(
+            gateway_cli, "_get_service_pids", return_value=set()
+        ), patch.object(
+            gateway_cli, "find_gateway_pids", return_value=[manual_pid],
+        ), patch("os.kill") as mock_kill, patch("subprocess.Popen") as mock_popen:
+            cmd_update(args)
+
+        captured = capsys.readouterr().out
+        mock_kill.assert_called_once()
+        assert mock_kill.call_args.args[0] == manual_pid
+        mock_popen.assert_called_once()
+        popen_cmd = mock_popen.call_args.args[0]
+        assert popen_cmd[:2] == ["bash", "-lc"]
+        assert "gateway run --replace" in popen_cmd[2]
+        assert f"kill -0 {manual_pid}" in popen_cmd[2]
+        assert "Replacement gateway will start automatically" in captured
+        assert "Restart manually" not in captured
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_terminal_update_keeps_manual_restart_guidance(
+        self, mock_run, _mock_which, capsys, monkeypatch,
+    ):
+        """Terminal updates should not daemonize a manual gateway unexpectedly."""
+        manual_pid = 42999
+
+        monkeypatch.setattr(gateway_cli, "is_macos", lambda: False)
+        monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: False)
+        monkeypatch.setattr(gateway_cli, "is_termux", lambda: False)
+        mock_run.side_effect = _make_run_side_effect(commit_count="3")
+
+        with patch.object(
+            gateway_cli, "_get_service_pids", return_value=set()
+        ), patch.object(
+            gateway_cli, "find_gateway_pids", return_value=[manual_pid],
+        ), patch("os.kill"), patch("subprocess.Popen") as mock_popen:
+            cmd_update(SimpleNamespace())
+
+        captured = capsys.readouterr().out
+        mock_popen.assert_not_called()
+        assert "Restart manually: hermes gateway run" in captured
 
 
 class TestGetServicePids:

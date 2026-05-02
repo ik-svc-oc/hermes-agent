@@ -492,28 +492,60 @@ class TtmIngress:
         )
         return str(response_body.get("approval_id", ""))
 
+    # -- ingress read --------------------------------------------------------
+
+    def get_run_state(self, run_id: str) -> dict[str, Any]:
+        """Return the current run state snapshot from TTM.
+
+        Calls ``GET {ingress_base_url}/api/ingress/runtime/{runtime_id}/runs/{run_id}/state``
+        with the same auth headers as the write routes. On success the response
+        ``scope_epoch`` is auto-applied to the binding so subsequent write
+        calls use the fresh epoch without the caller having to do it manually.
+
+        Raises :exc:`IngressNotBoundError` if ``bind_run`` has not been called,
+        :exc:`IngressAuthError` on 401 (token revoked — do not retry),
+        :exc:`IngressClientError` on non-401 4xx, :exc:`IngressServerError`
+        after retries exhausted.
+        """
+        binding = self._binding(run_id)
+        response_body = self._request(
+            binding,
+            "GET",
+            f"runs/{run_id}/state",
+            op="get_run_state",
+        )
+        scope_epoch = response_body.get("scope_epoch")
+        if scope_epoch is not None:
+            try:
+                self.update_scope_epoch(run_id, int(scope_epoch))
+            except (ValueError, IngressNotBoundError):
+                pass
+        return response_body
+
     # -- HTTP wire -----------------------------------------------------------
 
-    def _post(
+    def _request(
         self,
         binding: _IngressBinding,
+        method: str,
         path: str,
-        body: dict[str, Any],
+        body: dict[str, Any] | None = None,
         *,
         op: str,
         extra_log: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """POST one ingress request with retry/backoff + structured logging."""
+        """Send one ingress request with retry/backoff + structured logging."""
         url = (
             f"{binding.ingress_base_url}/api/ingress/runtime/"
             f"{binding.runtime_id}/{path}"
         )
-        headers = {
+        headers: dict[str, str] = {
             "Authorization": f"Bearer {binding.principal_token}",
             "X-Runtime-Id": binding.runtime_id,
             "X-Run-Id": binding.run_id,
-            "Content-Type": "application/json",
         }
+        if method == "POST":
+            headers["Content-Type"] = "application/json"
         log_ctx = {
             "op": op,
             "run_id": binding.run_id,
@@ -527,7 +559,10 @@ class TtmIngress:
         for attempt in range(1, self._max_retries + 1):
             try:
                 with self._client_factory() as client:
-                    response = client.post(url, json=body, headers=headers)
+                    if method == "GET":
+                        response = client.get(url, headers=headers)
+                    else:
+                        response = client.post(url, json=body, headers=headers)
             except httpx.HTTPError as exc:
                 last_error = repr(exc)
                 logger.warning(
@@ -602,6 +637,17 @@ class TtmIngress:
 
         # Loop falls through only if max_retries==0, which __init__ guards.
         raise IngressServerError(binding.run_id, self._max_retries, last_status, last_error)
+
+    def _post(
+        self,
+        binding: _IngressBinding,
+        path: str,
+        body: dict[str, Any],
+        *,
+        op: str,
+        extra_log: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return self._request(binding, "POST", path, body, op=op, extra_log=extra_log)
 
 
 # ---------------------------------------------------------------------------
@@ -721,6 +767,11 @@ def request_approval(
     )
 
 
+def get_run_state(run_id: str) -> dict[str, Any]:
+    """Return the current run state snapshot from TTM (auto-updates scope_epoch)."""
+    return get_default().get_run_state(run_id)
+
+
 __all__ = [
     "CANONICAL_EVENT_TYPES",
     "DEFAULT_MAX_RETRIES",
@@ -751,6 +802,7 @@ __all__ = [
     "bind_run",
     "bind_run_from_env",
     "get_default",
+    "get_run_state",
     "post_event",
     "post_evidence",
     "request_approval",

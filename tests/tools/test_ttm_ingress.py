@@ -78,6 +78,17 @@ class _StubClient:
             raise nxt
         return nxt
 
+    def get(self, url, headers=None):
+        self.calls.append((url, {}, headers or {}))
+        if callable(self._plan):
+            return self._plan(url, None, headers)
+        if not self._plan:
+            raise AssertionError("StubClient ran out of canned responses")
+        nxt = self._plan.pop(0)
+        if isinstance(nxt, Exception):
+            raise nxt
+        return nxt
+
 
 def _client_factory(plan):
     """Return a factory that yields a fresh _StubClient per call.
@@ -585,3 +596,73 @@ class TestBindFromEnv:
         monkeypatch.setenv(ENV_INGRESS_BASE_URL, "http://127.0.0.1:8000")
         run_id = ttm.bind_run_from_env()
         assert run_id == "run-os"
+
+
+# ---------------------------------------------------------------------------
+# get_run_state
+# ---------------------------------------------------------------------------
+
+
+class TestGetRunState:
+    _state_body = {
+        "run_id": RUN_ID,
+        "stream_id": "galactus",
+        "stream_version": "v1",
+        "scope_epoch": 3,
+        "status": "active",
+        "execution_contract": {
+            "required_tests": ["test_a"],
+            "approval_policy": ["scope"],
+        },
+        "approvals": [
+            {"approval_id": "ap-1", "approval_type": "scope", "status": "requested", "scope_epoch": 3}
+        ],
+    }
+
+    def test_returns_state_dict_and_updates_scope_epoch(self):
+        factory, stub = _client_factory([_StubResponse(200, self._state_body)])
+        ttm = TtmIngress(client_factory=factory)
+        _bind(ttm)
+        result = ttm.get_run_state(RUN_ID)
+        assert result["scope_epoch"] == 3
+        assert result["status"] == "active"
+        # scope_epoch auto-applied to binding
+        assert ttm._binding(RUN_ID).scope_epoch == 3
+        # Wire check: GET to the correct path with auth headers
+        url, _, headers = stub.calls[0]
+        assert f"/runs/{RUN_ID}/state" in url
+        assert headers["Authorization"] == f"Bearer {PRINCIPAL_TOKEN}"
+        assert headers["X-Run-Id"] == RUN_ID
+
+    def test_401_raises_ingress_auth_error(self):
+        factory, _ = _client_factory([_StubResponse(401, text="token_revoked")])
+        ttm = TtmIngress(client_factory=factory)
+        _bind(ttm)
+        with pytest.raises(IngressAuthError):
+            ttm.get_run_state(RUN_ID)
+
+    def test_5xx_retries_then_raises_server_error(self):
+        slept = []
+        factory, stub = _client_factory(
+            [_StubResponse(503)] * 3
+        )
+        ttm = TtmIngress(client_factory=factory, max_retries=3, sleep=slept.append)
+        _bind(ttm)
+        with pytest.raises(IngressServerError):
+            ttm.get_run_state(RUN_ID)
+        assert len(stub.calls) == 3
+        assert len(slept) == 2
+
+    def test_scope_epoch_update_skipped_if_field_missing(self):
+        body_no_epoch = {k: v for k, v in self._state_body.items() if k != "scope_epoch"}
+        factory, _ = _client_factory([_StubResponse(200, body_no_epoch)])
+        ttm = TtmIngress(client_factory=factory)
+        _bind(ttm)
+        ttm.get_run_state(RUN_ID)
+        # epoch stays at initial value (1) — no crash
+        assert ttm._binding(RUN_ID).scope_epoch == 1
+
+    def test_not_bound_raises(self):
+        ttm = TtmIngress()
+        with pytest.raises(IngressNotBoundError):
+            ttm.get_run_state("unbound-run")
