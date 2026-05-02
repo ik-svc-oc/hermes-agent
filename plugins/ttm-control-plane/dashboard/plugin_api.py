@@ -31,6 +31,10 @@ H6 adds lifecycle control (stop/pause/resume/expand_scope) via:
   POST /runs/{ref}/lifecycle   — unified lifecycle receiver (202 async)
   POST /runs/{ref}/stop        — compat alias for stop (TTM adapter pre-H6)
 
+H7 adds the Bridge Projection Rule overlay:
+  GET  /runs/{ref}/projection  — read-only producer-tagged projection of
+                                 plugin-held binding/process/pause state.
+
 Stop:  SIGTERM → 10s wait → SIGKILL; emits task.updated{stopped}.
 Pause: SIGSTOP; persists dossier state; emits task.updated{paused}.
        Degrades explicitly if platform SIGSTOP is unavailable.
@@ -47,6 +51,7 @@ import logging
 import os
 import shutil
 import signal
+import socket
 import sqlite3
 import threading
 import uuid
@@ -433,6 +438,40 @@ class LifecycleResponse(BaseModel):
     runtime_run_ref: str
     action: str
     accepted_at: datetime
+
+
+# ---------------------------------------------------------------------------
+# Bridge projection wire schema (H7)
+# ---------------------------------------------------------------------------
+
+
+class ProjectionResponse(BaseModel):
+    """Bridge Projection Rule-compliant overlay — read-only, plugin-sourced.
+
+    Per ``RUNTIME-ADAPTER-CONTRACT.md §Bridge Projection Rule`` this is a
+    read-only overlay that surfaces what the runtime plugin itself holds.
+    It must NEVER override TTM's canonical run state. Producer identity,
+    source endpoint, host identity, and freshness are mandatory so the
+    consumer can reason about staleness and provenance.
+    """
+
+    producer: str
+    source_endpoint: str
+    generated_at: datetime
+    freshness_hint: str
+    host_identity: str
+
+    run_id: str
+    runtime_run_ref: str
+    bound_at: datetime
+    last_status: str
+    payload_summary: dict[str, Any]
+
+    process_live: bool
+    process_pid: int | None
+
+    paused: bool
+    pause_dossier: dict[str, Any] | None
 
 
 # ---------------------------------------------------------------------------
@@ -1128,6 +1167,63 @@ async def runtime_run_status(
     raise HTTPException(
         status_code=status.HTTP_404_NOT_FOUND,
         detail={"reason": "runtime_run_ref_not_found"},
+    )
+
+
+@router.get("/runs/{runtime_run_ref}/projection", response_model=ProjectionResponse)
+async def bridge_projection(
+    runtime_run_ref: str,
+    x_ttm_control_plane_secret: str | None = Header(default=None, alias=_SECRET_HEADER),
+) -> ProjectionResponse:
+    """Bridge Projection Rule overlay for the dispatched run.
+
+    Read-only view of plugin-held state: SQLite-backed binding metadata,
+    in-memory process handle, and in-memory pause dossier. Never includes
+    the principal token, and never claims to override TTM's canonical run
+    state. ``freshness_hint`` is ``"live"`` when a live process handle is
+    registered for this run, else ``"registry"``.
+    """
+    _require_secret(x_ttm_control_plane_secret)
+
+    binding = _binding_by_ref(runtime_run_ref)
+    if binding is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"reason": "runtime_run_ref_not_found"},
+        )
+
+    proc_handle = _PROC_REGISTRY.get(binding.run_id)
+    process_live = proc_handle is not None
+    process_pid = proc_handle.pid if proc_handle is not None else None
+
+    with _PAUSE_LOCK:
+        pause_state = _PAUSE_STATE.get(binding.run_id)
+    if pause_state is None:
+        paused = False
+        pause_dossier: dict[str, Any] | None = None
+    else:
+        paused = True
+        pause_dossier = {
+            "paused_at": pause_state.paused_at.isoformat(),
+            "lane_id": pause_state.lane_id,
+            "worktree_id": pause_state.worktree_id,
+        }
+
+    return ProjectionResponse(
+        producer="hermes-ttm-control-plane",
+        source_endpoint="/runs/{ref}/projection",
+        generated_at=_utcnow(),
+        freshness_hint="live" if process_live else "registry",
+        host_identity=socket.gethostname(),
+        run_id=binding.run_id,
+        runtime_run_ref=binding.runtime_run_ref,
+        bound_at=binding.bound_at,
+        last_status=binding.last_status,
+        payload_summary=dict(binding.payload_summary),
+        process_live=process_live,
+        process_pid=process_pid,
+        paused=paused,
+        pause_dossier=pause_dossier,
     )
 
 
