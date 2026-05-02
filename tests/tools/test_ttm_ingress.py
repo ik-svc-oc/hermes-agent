@@ -13,6 +13,11 @@ import pytest
 
 from tools.ttm_ingress import (
     CANONICAL_EVENT_TYPES,
+    ENV_INGRESS_BASE_URL,
+    ENV_PRINCIPAL_TOKEN,
+    ENV_RUNTIME_ID,
+    ENV_RUN_ID,
+    ENV_SCOPE_EPOCH,
     EVENT_RUN_DISPATCHED,
     EVENT_TASK_UPDATED,
     IngressAuthError,
@@ -510,3 +515,73 @@ class TestCanonicalEvents:
                 "run.closed",
             }
         )
+
+
+# ---------------------------------------------------------------------------
+# bind_run_from_env — spawn-shim contract
+# ---------------------------------------------------------------------------
+
+
+class TestBindFromEnv:
+    def test_returns_run_id_and_binds(self):
+        ttm = TtmIngress()
+        env = {
+            ENV_RUN_ID: "run-from-env",
+            ENV_PRINCIPAL_TOKEN: "tok_envenv_envenv_envenv_envenv",
+            ENV_INGRESS_BASE_URL: "http://127.0.0.1:8000",
+        }
+        run_id = ttm.bind_run_from_env(env)
+        assert run_id == "run-from-env"
+        assert ttm.is_bound("run-from-env")
+
+    def test_returns_none_when_required_var_missing(self):
+        ttm = TtmIngress()
+        # Missing TTM_INGRESS_BASE_URL — must return None, not raise.
+        env = {
+            ENV_RUN_ID: "run-x",
+            ENV_PRINCIPAL_TOKEN: "tok_x",
+        }
+        assert ttm.bind_run_from_env(env) is None
+        assert not ttm.is_bound("run-x")
+
+    def test_empty_env_returns_none(self):
+        ttm = TtmIngress()
+        assert ttm.bind_run_from_env({}) is None
+
+    def test_picks_up_optional_runtime_id_and_scope_epoch(self):
+        factory, stub = _client_factory(
+            [_StubResponse(201, {"event_id": "ev-1"})]
+        )
+        ttm = TtmIngress(client_factory=factory)
+        env = {
+            ENV_RUN_ID: "run-y",
+            ENV_PRINCIPAL_TOKEN: "tok_yyyy_yyyy_yyyy_yyyy",
+            ENV_INGRESS_BASE_URL: "http://127.0.0.1:8000",
+            ENV_RUNTIME_ID: "hermes-shadow",
+            ENV_SCOPE_EPOCH: "7",
+        }
+        ttm.bind_run_from_env(env)
+        ttm.post_event("run-y", EVENT_TASK_UPDATED, {})
+        url, body, headers = stub.calls[0]
+        assert "/runtime/hermes-shadow/" in url
+        assert headers["X-Runtime-Id"] == "hermes-shadow"
+        assert body["expected_scope_epoch"] == 7
+
+    def test_invalid_scope_epoch_raises(self):
+        ttm = TtmIngress()
+        env = {
+            ENV_RUN_ID: "run-z",
+            ENV_PRINCIPAL_TOKEN: "tok_z",
+            ENV_INGRESS_BASE_URL: "http://127.0.0.1:8000",
+            ENV_SCOPE_EPOCH: "not-an-int",
+        }
+        with pytest.raises(ValueError, match="TTM_SCOPE_EPOCH"):
+            ttm.bind_run_from_env(env)
+
+    def test_defaults_to_os_environ(self, monkeypatch):
+        ttm = TtmIngress()
+        monkeypatch.setenv(ENV_RUN_ID, "run-os")
+        monkeypatch.setenv(ENV_PRINCIPAL_TOKEN, "tok_from_os_environ_xxxxx")
+        monkeypatch.setenv(ENV_INGRESS_BASE_URL, "http://127.0.0.1:8000")
+        run_id = ttm.bind_run_from_env()
+        assert run_id == "run-os"

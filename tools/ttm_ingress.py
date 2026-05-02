@@ -27,11 +27,12 @@ with exponential backoff before raising.
 """
 
 import logging
+import os
 import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 import httpx
 
@@ -71,6 +72,20 @@ DEFAULT_RUNTIME_ID = "hermes"
 DEFAULT_TIMEOUT_SECONDS = 10.0
 DEFAULT_MAX_RETRIES = 3
 DEFAULT_RETRY_BASE_DELAY = 0.5
+
+# ---------------------------------------------------------------------------
+# Bootstrap env vars — the dispatch-spawn shim sets these on the agent
+# process before exec, and :func:`bind_run_from_env` reads them at session
+# start. Until PR-F-H1's ``_spawn_headless_session`` is finished, operators
+# can also set these manually for local dev/testing of skills that depend
+# on TTM ingress.
+# ---------------------------------------------------------------------------
+
+ENV_RUN_ID = "TTM_RUN_ID"
+ENV_PRINCIPAL_TOKEN = "TTM_PRINCIPAL_TOKEN"
+ENV_INGRESS_BASE_URL = "TTM_INGRESS_BASE_URL"
+ENV_RUNTIME_ID = "TTM_RUNTIME_ID"
+ENV_SCOPE_EPOCH = "TTM_SCOPE_EPOCH"
 
 
 # ---------------------------------------------------------------------------
@@ -249,6 +264,59 @@ class TtmIngress:
                 ingress_base_url,
                 _redact_token(principal_token),
             )
+
+    def bind_run_from_env(
+        self,
+        env: Mapping[str, str] | None = None,
+    ) -> str | None:
+        """Bind the active run from bootstrap env vars set by the spawn shim.
+
+        Reads ``TTM_RUN_ID`` + ``TTM_PRINCIPAL_TOKEN`` + ``TTM_INGRESS_BASE_URL``
+        (and optional ``TTM_RUNTIME_ID`` / ``TTM_SCOPE_EPOCH``) from ``env``
+        (defaults to :mod:`os.environ`) and registers the binding. Returns
+        the bound ``run_id`` on success, or ``None`` if any required var is
+        missing — callers can use that as a "not running under TTM control"
+        signal.
+
+        This is the contract between PR-F-H1's spawn path and the agent
+        process: the spawn shim writes the per-run dispatch context into
+        env vars, then exec's the agent; the agent's H3+ skills call this
+        once at session start and stop carrying the token themselves.
+        """
+        source = env if env is not None else os.environ
+        run_id = source.get(ENV_RUN_ID)
+        token = source.get(ENV_PRINCIPAL_TOKEN)
+        base = source.get(ENV_INGRESS_BASE_URL)
+        if not (run_id and token and base):
+            logger.debug(
+                "ttm_ingress.bind_run_from_env.skipped missing=%s",
+                [
+                    name
+                    for name, val in (
+                        (ENV_RUN_ID, run_id),
+                        (ENV_PRINCIPAL_TOKEN, token),
+                        (ENV_INGRESS_BASE_URL, base),
+                    )
+                    if not val
+                ],
+            )
+            return None
+        runtime_id = source.get(ENV_RUNTIME_ID) or DEFAULT_RUNTIME_ID
+        scope_raw = source.get(ENV_SCOPE_EPOCH, "1").strip() or "1"
+        try:
+            scope_epoch = int(scope_raw)
+        except ValueError as exc:
+            raise ValueError(
+                f"{ENV_SCOPE_EPOCH}={scope_raw!r} is not an integer"
+            ) from exc
+        self.bind_run(
+            run_id,
+            token,
+            base,
+            runtime_id=runtime_id,
+            initial_scope_epoch=scope_epoch,
+        )
+        return run_id
 
     def unbind_run(self, run_id: str) -> None:
         """Drop the bound principal_token for ``run_id`` from memory."""
@@ -573,6 +641,11 @@ def bind_run(
     )
 
 
+def bind_run_from_env(env: Mapping[str, str] | None = None) -> str | None:
+    """Bind the default instance from bootstrap env vars (spawn-shim contract)."""
+    return get_default().bind_run_from_env(env)
+
+
 def unbind_run(run_id: str) -> None:
     get_default().unbind_run(run_id)
 
@@ -654,6 +727,11 @@ __all__ = [
     "DEFAULT_RETRY_BASE_DELAY",
     "DEFAULT_RUNTIME_ID",
     "DEFAULT_TIMEOUT_SECONDS",
+    "ENV_INGRESS_BASE_URL",
+    "ENV_PRINCIPAL_TOKEN",
+    "ENV_RUNTIME_ID",
+    "ENV_RUN_ID",
+    "ENV_SCOPE_EPOCH",
     "EVENT_APPROVAL_GRANTED",
     "EVENT_APPROVAL_REJECTED",
     "EVENT_APPROVAL_REQUESTED",
@@ -671,6 +749,7 @@ __all__ = [
     "IngressServerError",
     "TtmIngress",
     "bind_run",
+    "bind_run_from_env",
     "get_default",
     "post_event",
     "post_evidence",
