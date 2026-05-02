@@ -1176,3 +1176,182 @@ def test_spawn_logs_when_executable_missing(monkeypatch: pytest.MonkeyPatch) -> 
     )
     # Process must not be registered when spawn was skipped.
     assert plugin._PROC_REGISTRY.get(binding.run_id) is None
+
+
+# ---------------------------------------------------------------------------
+# /runs/{ref}/projection — Bridge Projection Rule overlay (H7)
+# ---------------------------------------------------------------------------
+
+
+def test_projection_returns_404_for_unknown_ref(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, _ = _make_client(monkeypatch)
+    resp = client.get(
+        "/api/plugins/ttm-control-plane/runs/hermes-not-real/projection",
+        headers={"X-TTM-Control-Plane-Secret": "test-secret"},
+    )
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == {"reason": "runtime_run_ref_not_found"}
+
+
+def test_projection_returns_binding_fields(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Projection surfaces binding metadata + producer/source/host identity."""
+    client, _ = _make_client(monkeypatch)
+    headers = {"X-TTM-Control-Plane-Secret": "test-secret"}
+    run_id, ref = _dispatch_and_get_ref(client, headers)
+
+    resp = client.get(
+        f"/api/plugins/ttm-control-plane/runs/{ref}/projection",
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["producer"] == "hermes-ttm-control-plane"
+    assert body["source_endpoint"] == "/runs/{ref}/projection"
+    assert body["host_identity"]
+    assert body["generated_at"]
+    assert body["run_id"] == run_id
+    assert body["runtime_run_ref"] == ref
+    assert body["bound_at"]
+    assert body["last_status"] in {"accepted", "pending"}
+    assert "stream_id" in body["payload_summary"]
+    # No live process is registered (spawn disabled in tests).
+    assert body["process_live"] is False
+    assert body["process_pid"] is None
+    assert body["freshness_hint"] == "registry"
+    assert body["paused"] is False
+    assert body["pause_dossier"] is None
+
+
+def test_projection_includes_process_live_true_when_proc_registered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, plugin = _make_client(monkeypatch)
+    headers = {"X-TTM-Control-Plane-Secret": "test-secret"}
+    run_id, ref = _dispatch_and_get_ref(client, headers)
+
+    mock_proc = MagicMock()
+    mock_proc.pid = 12345
+    plugin._PROC_REGISTRY.register(run_id, mock_proc)
+
+    resp = client.get(
+        f"/api/plugins/ttm-control-plane/runs/{ref}/projection",
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["process_live"] is True
+    assert body["process_pid"] == 12345
+    assert body["freshness_hint"] == "live"
+
+
+def test_projection_process_live_false_when_no_proc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, plugin = _make_client(monkeypatch)
+    headers = {"X-TTM-Control-Plane-Secret": "test-secret"}
+    run_id, ref = _dispatch_and_get_ref(client, headers)
+
+    # Ensure no handle is registered for this run.
+    plugin._PROC_REGISTRY.remove(run_id)
+
+    resp = client.get(
+        f"/api/plugins/ttm-control-plane/runs/{ref}/projection",
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["process_live"] is False
+    assert body["process_pid"] is None
+    assert body["freshness_hint"] == "registry"
+
+
+def test_projection_includes_pause_dossier_when_paused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, plugin = _make_client(monkeypatch)
+    headers = {"X-TTM-Control-Plane-Secret": "test-secret"}
+    run_id, ref = _dispatch_and_get_ref(client, headers)
+
+    from datetime import UTC, datetime as _dt
+
+    paused_at = _dt.now(UTC)
+    state = plugin._PauseState(
+        run_id=run_id,
+        pid=4242,
+        paused_at=paused_at,
+        lane_id="main-lane",
+        worktree_id="wt-abc",
+    )
+    with plugin._PAUSE_LOCK:
+        plugin._PAUSE_STATE[run_id] = state
+
+    resp = client.get(
+        f"/api/plugins/ttm-control-plane/runs/{ref}/projection",
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["paused"] is True
+    dossier = body["pause_dossier"]
+    assert dossier is not None
+    assert dossier["paused_at"] == paused_at.isoformat()
+    assert dossier["lane_id"] == "main-lane"
+    assert dossier["worktree_id"] == "wt-abc"
+
+
+def test_projection_no_pause_dossier_when_not_paused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, plugin = _make_client(monkeypatch)
+    headers = {"X-TTM-Control-Plane-Secret": "test-secret"}
+    run_id, ref = _dispatch_and_get_ref(client, headers)
+
+    with plugin._PAUSE_LOCK:
+        plugin._PAUSE_STATE.pop(run_id, None)
+
+    resp = client.get(
+        f"/api/plugins/ttm-control-plane/runs/{ref}/projection",
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["paused"] is False
+    assert body["pause_dossier"] is None
+
+
+def test_projection_never_includes_principal_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Bridge Projection must never leak the principal token, even when
+    the plugin still holds one in memory (pre-dispatch-callback)."""
+    client, plugin = _make_client(monkeypatch)
+    headers = {"X-TTM-Control-Plane-Secret": "test-secret"}
+    run_id, ref = _dispatch_and_get_ref(client, headers)
+
+    # Force a token onto the binding to simulate the pre-callback window.
+    secret_token = "super-secret-bearer-credential-DO-NOT-LEAK"
+    assert plugin._REGISTRY.replace_token(run_id, secret_token)
+
+    resp = client.get(
+        f"/api/plugins/ttm-control-plane/runs/{ref}/projection",
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    # Sanity: the binding actually has the token in memory right now.
+    assert plugin._REGISTRY.get(run_id).principal_token == secret_token
+    # And yet the projection body never contains it under any field.
+    serialized = resp.text
+    assert secret_token not in serialized
+    assert "principal_token" not in body
+
+
+def test_projection_rejects_missing_secret(monkeypatch: pytest.MonkeyPatch) -> None:
+    client, _ = _make_client(monkeypatch)
+    headers = {"X-TTM-Control-Plane-Secret": "test-secret"}
+    _, ref = _dispatch_and_get_ref(client, headers)
+
+    resp = client.get(f"/api/plugins/ttm-control-plane/runs/{ref}/projection")
+    assert resp.status_code == 401
