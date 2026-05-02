@@ -464,6 +464,12 @@ class ProjectionResponse(BaseModel):
     run_id: str
     runtime_run_ref: str
     bound_at: datetime
+    # ``status`` mirrors ``last_status`` so the TTM runs.py consumer and
+    # ``_runtime_status_label()`` (which look up ``bridge_projection["status"]``
+    # by the same convention used on /runs/{ref}/status) read the right value
+    # without falling back to ``"unknown"``. ``last_status`` is retained for
+    # parity with the binding dataclass and explicit semantics.
+    status: str
     last_status: str
     payload_summary: dict[str, Any]
 
@@ -1218,6 +1224,7 @@ async def bridge_projection(
         run_id=binding.run_id,
         runtime_run_ref=binding.runtime_run_ref,
         bound_at=binding.bound_at,
+        status=binding.last_status,
         last_status=binding.last_status,
         payload_summary=dict(binding.payload_summary),
         process_live=process_live,
