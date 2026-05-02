@@ -16,7 +16,7 @@ import threading
 import uuid
 from pathlib import Path
 from datetime import datetime, timedelta
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any
 
 logger = logging.getLogger(__name__)
@@ -62,6 +62,7 @@ from .config import (
 )
 from .whatsapp_identity import (
     canonical_whatsapp_identifier,
+    normalize_whatsapp_identifier,  # noqa: F401 - re-exported for gateway.session callers
 )
 from utils import atomic_replace
 
@@ -155,6 +156,112 @@ class SessionSource:
     
 
 
+def _datetime_to_iso(value: Optional[datetime]) -> Optional[str]:
+    return value.isoformat() if value else None
+
+
+def _datetime_from_iso(value: Any) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
+@dataclass
+class SessionGoalContract:
+    """First-class, persisted session objective authority.
+
+    Compaction summaries are historical references.  The goal contract is the
+    explicit task agreement for the live session and is injected ahead of
+    mutable/LLM-authored context so summaries cannot silently redefine the job.
+    """
+
+    current_objective: str
+    status: str = "active"
+    scope_policy: str = "soft"
+    operator_confirmed: bool = False
+    locked: bool = False
+    original_prompt: Optional[str] = None
+    allowed_subtasks: List[str] = field(default_factory=list)
+    non_goals: List[str] = field(default_factory=list)
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+    confirmed_at: Optional[datetime] = None
+    locked_at: Optional[datetime] = None
+
+    def __post_init__(self) -> None:
+        now = _now()
+        if self.created_at is None:
+            self.created_at = now
+        if self.updated_at is None:
+            self.updated_at = now
+
+    def touch(self) -> None:
+        self.updated_at = _now()
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "current_objective": self.current_objective,
+            "status": self.status,
+            "scope_policy": self.scope_policy,
+            "operator_confirmed": self.operator_confirmed,
+            "locked": self.locked,
+            "original_prompt": self.original_prompt,
+            "allowed_subtasks": list(self.allowed_subtasks or []),
+            "non_goals": list(self.non_goals or []),
+            "created_at": _datetime_to_iso(self.created_at),
+            "updated_at": _datetime_to_iso(self.updated_at),
+            "confirmed_at": _datetime_to_iso(self.confirmed_at),
+            "locked_at": _datetime_to_iso(self.locked_at),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "SessionGoalContract":
+        return cls(
+            current_objective=str(data.get("current_objective") or "").strip(),
+            status=str(data.get("status") or "active"),
+            scope_policy=str(data.get("scope_policy") or "soft"),
+            operator_confirmed=bool(data.get("operator_confirmed", False)),
+            locked=bool(data.get("locked", False)),
+            original_prompt=data.get("original_prompt"),
+            allowed_subtasks=list(data.get("allowed_subtasks") or []),
+            non_goals=list(data.get("non_goals") or []),
+            created_at=_datetime_from_iso(data.get("created_at")) or _now(),
+            updated_at=_datetime_from_iso(data.get("updated_at")) or _now(),
+            confirmed_at=_datetime_from_iso(data.get("confirmed_at")),
+            locked_at=_datetime_from_iso(data.get("locked_at")),
+        )
+
+    def to_prompt_block(self) -> str:
+        lines = [
+            "## Session Goal Contract",
+            "",
+            (
+                "This block is the highest-priority session authority after the "
+                "system/developer instructions. It supersedes compaction summaries, "
+                "transcript summaries, and stale handoff text when they conflict."
+            ),
+            "",
+            f"**Objective:** {self.current_objective}",
+            f"**Status:** {self.status}",
+            f"**Scope policy:** {self.scope_policy}",
+            f"**Locked:** {'yes' if self.locked else 'no'}",
+        ]
+        if self.operator_confirmed:
+            lines.append("**Operator confirmed:** yes")
+        if self.allowed_subtasks:
+            lines.append("**Allowed subtasks:**")
+            lines.extend(f"- {item}" for item in self.allowed_subtasks)
+        if self.non_goals:
+            lines.append("**Non-goals / out of scope:**")
+            lines.extend(f"- {item}" for item in self.non_goals)
+        lines.append("")
+        lines.append("If the latest user message conflicts with this contract, ask for explicit goal update rather than silently changing scope.")
+        return "\n".join(lines)
+
+
 @dataclass
 class SessionContext:
     """
@@ -175,6 +282,7 @@ class SessionContext:
     session_id: str = ""
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+    goal_contract: Optional[SessionGoalContract] = None
     
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -188,6 +296,7 @@ class SessionContext:
             "session_id": self.session_id,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+            "goal_contract": self.goal_contract.to_dict() if self.goal_contract else None,
         }
 
 
@@ -234,7 +343,7 @@ def build_session_context_prompt(
 ) -> str:
     """
     Build the dynamic system prompt section that tells the agent about its context.
-    
+
     This is injected into the system prompt so the agent knows:
     - Where messages are coming from
     - What platforms are connected
@@ -246,13 +355,27 @@ def build_session_context_prompt(
     Platforms like Discord are excluded because mentions need real IDs.
     Routing still uses the original values (they stay in SessionSource).
     """
-    # Only apply redaction on platforms where IDs aren't needed for mentions
-    redact_pii = redact_pii and context.source.platform in _PII_SAFE_PLATFORMS
-    lines = [
+    # Only apply redaction on platforms where IDs aren't needed for mentions.
+    # Check both the hardcoded set (builtins) and the plugin registry.
+    _is_pii_safe = context.source.platform in _PII_SAFE_PLATFORMS
+    if not _is_pii_safe:
+        try:
+            from gateway.platform_registry import platform_registry
+            entry = platform_registry.get(context.source.platform.value)
+            if entry and entry.pii_safe:
+                _is_pii_safe = True
+        except Exception:
+            pass
+    redact_pii = redact_pii and _is_pii_safe
+    lines = []
+    if context.goal_contract:
+        lines.extend([context.goal_contract.to_prompt_block(), ""])
+
+    lines.extend([
         "## Current Session Context",
         "",
-    ]
-    
+    ])
+
     # Source info
     platform_name = context.source.platform.value.title()
     if context.source.platform == Platform.LOCAL:
@@ -277,7 +400,7 @@ def build_session_context_prompt(
         else:
             desc = src.description
         lines.append(f"**Source:** {platform_name} ({desc})")
-    
+
     # Channel topic (if available - provides context about the channel's purpose)
     if context.source.chat_topic:
         lines.append(f"**Channel Topic:** {context.source.chat_topic}")
@@ -302,7 +425,7 @@ def build_session_context_prompt(
         if redact_pii:
             uid = _hash_sender_id(uid)
         lines.append(f"**User ID:** {uid}")
-    
+
     # Platform-specific behavioral notes
     if context.source.platform == Platform.SLACK:
         lines.append("")
@@ -368,9 +491,9 @@ def build_session_context_prompt(
     for p in context.connected_platforms:
         if p != Platform.LOCAL:
             platforms_list.append(f"{p.value}: Connected ✓")
-    
+
     lines.append(f"**Connected Platforms:** {', '.join(platforms_list)}")
-    
+
     # Home channels
     if context.home_channels:
         lines.append("")
@@ -378,11 +501,11 @@ def build_session_context_prompt(
         for platform, home in context.home_channels.items():
             hc_id = _hash_chat_id(home.chat_id) if redact_pii else home.chat_id
             lines.append(f"  - {platform.value}: {home.name} (ID: {hc_id})")
-    
+
     # Delivery options for scheduled tasks
     lines.append("")
     lines.append("**Delivery options for scheduled tasks:**")
-    
+
     from hermes_constants import display_hermes_home
 
     # Origin delivery
@@ -398,15 +521,15 @@ def build_session_context_prompt(
     lines.append(
         f"- `\"local\"` → Save to local files only ({display_hermes_home()}/cron/output/)"
     )
-    
+
     # Platform home channels
     for platform, home in context.home_channels.items():
         lines.append(f"- `\"{platform.value}\"` → Home channel ({home.name})")
-    
+
     # Note about explicit targeting
     lines.append("")
     lines.append("*For explicit targeting, use `\"platform:chat_id\"` format if the user provides a specific chat ID.*")
-    
+
     return "\n".join(lines)
 
 
@@ -471,6 +594,11 @@ class SessionEntry:
     resume_reason: Optional[str] = None  # e.g. "restart_timeout"
     last_resume_marked_at: Optional[datetime] = None
 
+    # First-class task authority for this session.  It is persisted alongside
+    # session metadata so compression/resume can never be the sole source of
+    # truth for the active objective.
+    goal_contract: Optional[SessionGoalContract] = None
+
     def to_dict(self) -> Dict[str, Any]:
         result = {
             "session_key": self.session_key,
@@ -497,6 +625,7 @@ class SessionEntry:
                 if self.last_resume_marked_at
                 else None
             ),
+            "goal_contract": self.goal_contract.to_dict() if self.goal_contract else None,
         }
         if self.origin:
             result["origin"] = self.origin.to_dict()
@@ -523,6 +652,14 @@ class SessionEntry:
             except (TypeError, ValueError):
                 last_resume_marked_at = None
 
+        goal_contract = None
+        if data.get("goal_contract"):
+            try:
+                goal_contract = SessionGoalContract.from_dict(data["goal_contract"])
+            except Exception as e:
+                logger.debug("Invalid goal_contract for session %r: %s", data.get("session_id"), e)
+                goal_contract = None
+
         return cls(
             session_key=data["session_key"],
             session_id=data["session_id"],
@@ -545,6 +682,7 @@ class SessionEntry:
             resume_pending=data.get("resume_pending", False),
             resume_reason=data.get("resume_reason"),
             last_resume_marked_at=last_resume_marked_at,
+            goal_contract=goal_contract,
         )
 
 
@@ -1354,5 +1492,6 @@ def build_session_context(
         context.session_id = session_entry.session_id
         context.created_at = session_entry.created_at
         context.updated_at = session_entry.updated_at
+        context.goal_contract = session_entry.goal_contract
     
     return context

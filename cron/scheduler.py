@@ -341,27 +341,6 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     from tools.send_message_tool import _send_to_platform
     from gateway.config import load_gateway_config, Platform
 
-    platform_map = {
-        "telegram": Platform.TELEGRAM,
-        "discord": Platform.DISCORD,
-        "slack": Platform.SLACK,
-        "whatsapp": Platform.WHATSAPP,
-        "signal": Platform.SIGNAL,
-        "matrix": Platform.MATRIX,
-        "mattermost": Platform.MATTERMOST,
-        "homeassistant": Platform.HOMEASSISTANT,
-        "dingtalk": Platform.DINGTALK,
-        "feishu": Platform.FEISHU,
-        "wecom": Platform.WECOM,
-        "wecom_callback": Platform.WECOM_CALLBACK,
-        "weixin": Platform.WEIXIN,
-        "email": Platform.EMAIL,
-        "sms": Platform.SMS,
-        "bluebubbles": Platform.BLUEBUBBLES,
-        "qqbot": Platform.QQBOT,
-        "yuanbao": Platform.YUANBAO,
-    }
-
     # Optionally wrap the content with a header/footer so the user knows this
     # is a cron delivery.  Wrapping is on by default; set cron.wrap_response: false
     # in config.yaml for clean output.
@@ -418,9 +397,19 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 job["id"], platform_name, chat_id, thread_id,
             )
 
-        platform = platform_map.get(platform_name.lower())
-        if not platform:
+        # Built-in names resolve to their enum member; plugin platform names
+        # create dynamic members via Platform._missing_().
+        try:
+            platform = Platform(platform_name.lower())
+        except (ValueError, KeyError):
             msg = f"unknown platform '{platform_name}'"
+            logger.warning("Job '%s': %s", job["id"], msg)
+            delivery_errors.append(msg)
+            continue
+
+        pconfig = config.platforms.get(platform)
+        if not pconfig or not pconfig.enabled:
+            msg = f"platform '{platform_name}' not configured/enabled"
             logger.warning("Job '%s': %s", job["id"], msg)
             delivery_errors.append(msg)
             continue
@@ -467,13 +456,6 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 )
 
         if not delivered:
-            pconfig = config.platforms.get(platform)
-            if not pconfig or not pconfig.enabled:
-                msg = f"platform '{platform_name}' not configured/enabled"
-                logger.warning("Job '%s': %s", job["id"], msg)
-                delivery_errors.append(msg)
-                continue
-
             # Standalone path: run the async send in a fresh event loop (safe from any thread)
             coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
             try:
