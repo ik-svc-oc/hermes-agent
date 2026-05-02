@@ -1215,6 +1215,10 @@ def test_projection_returns_binding_fields(monkeypatch: pytest.MonkeyPatch) -> N
     assert body["runtime_run_ref"] == ref
     assert body["bound_at"]
     assert body["last_status"] in {"accepted", "pending"}
+    # ``status`` must mirror ``last_status`` so the TTM runs.py consumer
+    # (and _runtime_status_label) read a real value rather than falling
+    # back to "unknown" / "failed".
+    assert body["status"] == body["last_status"]
     assert "stream_id" in body["payload_summary"]
     # No live process is registered (spawn disabled in tests).
     assert body["process_live"] is False
@@ -1346,6 +1350,28 @@ def test_projection_never_includes_principal_token(
     serialized = resp.text
     assert secret_token not in serialized
     assert "principal_token" not in body
+
+
+def test_projection_status_tracks_binding_last_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mutating last_status on the binding must surface in projection.status
+    too — they are intentionally kept in lock-step so TTM's runs.py consumer
+    (which reads ``bridge_projection.get("status")``) sees real run state."""
+    client, plugin = _make_client(monkeypatch)
+    headers = {"X-TTM-Control-Plane-Secret": "test-secret"}
+    run_id, ref = _dispatch_and_get_ref(client, headers)
+
+    plugin._REGISTRY.update_status(run_id, last_status="paused")
+
+    resp = client.get(
+        f"/api/plugins/ttm-control-plane/runs/{ref}/projection",
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "paused"
+    assert body["last_status"] == "paused"
 
 
 def test_projection_rejects_missing_secret(monkeypatch: pytest.MonkeyPatch) -> None:
