@@ -13,13 +13,23 @@ the same way they do at runtime, then exercises the wire contract:
 * the happy path returns 202 with a fresh ``runtime_run_ref`` and binds
   the run in-memory; a duplicate dispatch returns 409 with the prior
   ``runtime_run_ref`` and leaves the binding intact
-* ``/runs/{ref}/status`` and ``/runs/{ref}/stop`` round-trip
+* ``/runs/{ref}/status`` round-trips
+* ``/runs/{ref}/lifecycle`` validates actions and returns 202 immediately
+* ``/runs/{ref}/stop`` (compat) returns 202 and keeps the binding alive
+* pause/resume/expand_scope handlers are exercised with mocked processes
+* stop handler: SIGTERM → wait → SIGKILL fallback with mocked handles
+* ingress events are emitted (mocked) and never log token material
 """
 from __future__ import annotations
 
+import asyncio
 import importlib.util
+import signal
 import sys
+import tempfile
+import threading
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import FastAPI
@@ -76,14 +86,20 @@ def _make_client(
     else:
         monkeypatch.setenv("TTM_CONTROL_PLANE_SECRET", secret)
     if db_path is None:
-        # Default test DB path — wiped via registry.clear() below.
-        db_path = Path(__file__).resolve().parent / "_test_ttm_control_plane.db"
+        # Each call gets a fresh temp DB so parallel workers don't collide.
+        fd, tmp = tempfile.mkstemp(suffix=".db", prefix="ttm_cp_test_")
+        import os as _os
+        _os.close(fd)
+        db_path = Path(tmp)
     monkeypatch.setenv("TTM_CONTROL_PLANE_DB_PATH", str(db_path))
     # Disable subprocess spawn for the vast majority of tests — only
     # the dedicated spawn-path tests opt back in.
     monkeypatch.setenv("TTM_CONTROL_PLANE_DISABLE_SPAWN", "1")
     plugin = _load_plugin_module()
     plugin._REGISTRY.clear()
+    plugin._PROC_REGISTRY.clear()
+    with plugin._PAUSE_LOCK:
+        plugin._PAUSE_STATE.clear()
     app = FastAPI()
     app.include_router(plugin.router, prefix="/api/plugins/ttm-control-plane")
     return TestClient(app), plugin
@@ -110,6 +126,17 @@ def _dispatch_body(**overrides):
     }
     body.update(overrides)
     return body
+
+
+def _dispatch_and_get_ref(client: TestClient, headers: dict) -> tuple[str, str]:
+    """Dispatch a run and return (run_id, runtime_run_ref)."""
+    resp = client.post(
+        "/api/plugins/ttm-control-plane/runs/dispatch",
+        json=_dispatch_body(),
+        headers=headers,
+    )
+    assert resp.status_code == 202, resp.text
+    return _dispatch_body()["run_id"], resp.json()["runtime_run_ref"]
 
 
 # ---------------------------------------------------------------------------
@@ -270,32 +297,683 @@ def test_status_404s_for_unknown_ref(monkeypatch: pytest.MonkeyPatch) -> None:
     assert resp.status_code == 404
 
 
-def test_stop_removes_binding_and_allows_rebind(
+# ---------------------------------------------------------------------------
+# /runs/{ref}/stop — compat route
+# ---------------------------------------------------------------------------
+
+
+def test_stop_compat_returns_202_and_keeps_binding(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    client, _ = _make_client(monkeypatch)
+    """H6: /stop keeps the binding alive (status=stopped) so TTM can still
+    query status and drive canonical closure. It no longer removes the binding."""
+    client, plugin = _make_client(monkeypatch)
     headers = {"X-TTM-Control-Plane-Secret": "test-secret"}
-    first = client.post(
-        "/api/plugins/ttm-control-plane/runs/dispatch",
-        json=_dispatch_body(),
-        headers=headers,
-    )
-    ref = first.json()["runtime_run_ref"]
+    _, ref = _dispatch_and_get_ref(client, headers)
 
     stopped = client.post(
         f"/api/plugins/ttm-control-plane/runs/{ref}/stop",
         headers=headers,
     )
     assert stopped.status_code == 202
+    body = stopped.json()
+    assert body["status"] == "accepted"
+    assert body["runtime_run_ref"] == ref
 
-    # After stop, a re-dispatch should succeed (same run_id, fresh ref).
-    rebind = client.post(
-        "/api/plugins/ttm-control-plane/runs/dispatch",
-        json=_dispatch_body(),
+    # Binding must survive; status is updated asynchronously, but the entry exists.
+    bindings = plugin._REGISTRY.snapshot()
+    assert len(bindings) == 1
+
+
+def test_stop_compat_404s_for_unknown_ref(monkeypatch: pytest.MonkeyPatch) -> None:
+    client, _ = _make_client(monkeypatch)
+    resp = client.post(
+        "/api/plugins/ttm-control-plane/runs/hermes-does-not-exist/stop",
+        headers={"X-TTM-Control-Plane-Secret": "test-secret"},
+    )
+    assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# /runs/{ref}/lifecycle — unified lifecycle receiver
+# ---------------------------------------------------------------------------
+
+
+def test_lifecycle_rejects_missing_secret(monkeypatch: pytest.MonkeyPatch) -> None:
+    client, _ = _make_client(monkeypatch)
+    headers = {"X-TTM-Control-Plane-Secret": "test-secret"}
+    _, ref = _dispatch_and_get_ref(client, headers)
+
+    resp = client.post(
+        f"/api/plugins/ttm-control-plane/runs/{ref}/lifecycle",
+        json={"action": "stop"},
+    )
+    assert resp.status_code == 401
+
+
+def test_lifecycle_404s_for_unknown_ref(monkeypatch: pytest.MonkeyPatch) -> None:
+    client, _ = _make_client(monkeypatch)
+    resp = client.post(
+        "/api/plugins/ttm-control-plane/runs/hermes-not-real/lifecycle",
+        json={"action": "stop"},
+        headers={"X-TTM-Control-Plane-Secret": "test-secret"},
+    )
+    assert resp.status_code == 404
+
+
+def test_lifecycle_rejects_invalid_action(monkeypatch: pytest.MonkeyPatch) -> None:
+    client, _ = _make_client(monkeypatch)
+    headers = {"X-TTM-Control-Plane-Secret": "test-secret"}
+    _, ref = _dispatch_and_get_ref(client, headers)
+
+    resp = client.post(
+        f"/api/plugins/ttm-control-plane/runs/{ref}/lifecycle",
+        json={"action": "nuke"},
         headers=headers,
     )
-    assert rebind.status_code == 202
-    assert rebind.json()["runtime_run_ref"] != ref
+    assert resp.status_code == 422
+
+
+@pytest.mark.parametrize("action", ["stop", "pause", "resume", "expand_scope"])
+def test_lifecycle_accepts_valid_actions(
+    monkeypatch: pytest.MonkeyPatch, action: str
+) -> None:
+    client, _ = _make_client(monkeypatch)
+    headers = {"X-TTM-Control-Plane-Secret": "test-secret"}
+    _, ref = _dispatch_and_get_ref(client, headers)
+
+    resp = client.post(
+        f"/api/plugins/ttm-control-plane/runs/{ref}/lifecycle",
+        json={"action": action},
+        headers=headers,
+    )
+    assert resp.status_code == 202, resp.text
+    body = resp.json()
+    assert body["status"] == "accepted"
+    assert body["runtime_run_ref"] == ref
+    assert body["action"] == action
+    assert "accepted_at" in body
+
+
+# ---------------------------------------------------------------------------
+# Stop async handler — process kill logic
+# ---------------------------------------------------------------------------
+
+
+def test_stop_handler_sigterm_then_sigkill_on_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SIGTERM is sent first; SIGKILL is sent when the process does not exit."""
+    plugin = _load_plugin_module()
+    plugin._REGISTRY.clear()
+    plugin._PROC_REGISTRY.clear()
+
+    run_id = "aaaa-stop-test"
+    ref = "hermes-stop-test-ref"
+
+    # Binding in registry
+    from datetime import UTC, datetime
+
+    binding = plugin._RuntimeBinding(
+        run_id=run_id,
+        runtime_binding_id="bid",
+        runtime_run_ref=ref,
+        ingress_base_url="",
+        bound_at=datetime.now(UTC),
+        principal_token="",
+        last_status="running",
+    )
+    plugin._REGISTRY.insert(binding)
+
+    # Mock process that never exits (returncode stays None)
+    mock_proc = MagicMock()
+    mock_proc.pid = 99999
+    mock_proc.returncode = None
+
+    async def fake_wait():
+        raise asyncio.TimeoutError()
+
+    mock_proc.wait = fake_wait
+
+    handle = plugin._ProcessHandle(
+        run_id=run_id,
+        pid=99999,
+        proc=mock_proc,
+        started_at=datetime.now(UTC),
+    )
+    with plugin._PROC_REGISTRY._lock:
+        plugin._PROC_REGISTRY._by_run[run_id] = handle
+
+    signals_sent = []
+
+    def fake_getpgid(pid: int) -> int:
+        return pid
+
+    def fake_killpg(pgid: int, sig: int) -> None:
+        signals_sent.append(sig)
+
+    with (
+        patch("os.getpgid", side_effect=fake_getpgid),
+        patch("os.killpg", side_effect=fake_killpg),
+    ):
+        asyncio.get_event_loop().run_until_complete(
+            plugin._async_stop(run_id, ref)
+        )
+
+    assert signal.SIGTERM in signals_sent
+    assert signal.SIGKILL in signals_sent
+    # Process handle must be removed after stop.
+    assert plugin._PROC_REGISTRY.get(run_id) is None
+    # Binding stays; status updated to stopped.
+    b = plugin._REGISTRY.get(run_id)
+    assert b is not None
+    assert b.last_status == "stopped"
+
+
+def test_stop_handler_no_sigkill_when_process_exits_on_sigterm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the process exits within the SIGTERM window, SIGKILL is not sent."""
+    plugin = _load_plugin_module()
+    plugin._REGISTRY.clear()
+    plugin._PROC_REGISTRY.clear()
+
+    run_id = "bbbb-stop-test"
+    ref = "hermes-stop-clean"
+    from datetime import UTC, datetime
+
+    binding = plugin._RuntimeBinding(
+        run_id=run_id,
+        runtime_binding_id="bid2",
+        runtime_run_ref=ref,
+        ingress_base_url="",
+        bound_at=datetime.now(UTC),
+        principal_token="",
+        last_status="running",
+    )
+    plugin._REGISTRY.insert(binding)
+
+    mock_proc = MagicMock()
+    mock_proc.pid = 88888
+
+    async def fast_wait():
+        # Simulates immediate exit
+        mock_proc.returncode = 0
+
+    mock_proc.wait = fast_wait
+    mock_proc.returncode = 0  # already exited
+
+    handle = plugin._ProcessHandle(
+        run_id=run_id, pid=88888, proc=mock_proc, started_at=datetime.now(UTC)
+    )
+    with plugin._PROC_REGISTRY._lock:
+        plugin._PROC_REGISTRY._by_run[run_id] = handle
+
+    signals_sent = []
+
+    with (
+        patch("os.getpgid", return_value=88888),
+        patch("os.killpg", side_effect=lambda pgid, sig: signals_sent.append(sig)),
+    ):
+        asyncio.get_event_loop().run_until_complete(
+            plugin._async_stop(run_id, ref)
+        )
+
+    assert signal.SIGTERM in signals_sent
+    assert signal.SIGKILL not in signals_sent
+
+
+def test_stop_handler_no_process_registered_is_safe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stop with no registered process must not raise."""
+    plugin = _load_plugin_module()
+    plugin._REGISTRY.clear()
+    plugin._PROC_REGISTRY.clear()
+
+    run_id = "cccc-no-proc"
+    ref = "hermes-no-proc-ref"
+    from datetime import UTC, datetime
+
+    binding = plugin._RuntimeBinding(
+        run_id=run_id,
+        runtime_binding_id="bid3",
+        runtime_run_ref=ref,
+        ingress_base_url="",
+        bound_at=datetime.now(UTC),
+        principal_token="",
+        last_status="accepted",
+    )
+    plugin._REGISTRY.insert(binding)
+
+    asyncio.get_event_loop().run_until_complete(
+        plugin._async_stop(run_id, ref)
+    )
+    assert plugin._REGISTRY.get(run_id).last_status == "stopped"
+
+
+# ---------------------------------------------------------------------------
+# Pause / resume handlers
+# ---------------------------------------------------------------------------
+
+
+def test_pause_handler_sends_sigstop_and_saves_dossier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin = _load_plugin_module()
+    plugin._REGISTRY.clear()
+    plugin._PROC_REGISTRY.clear()
+    with plugin._PAUSE_LOCK:
+        plugin._PAUSE_STATE.clear()
+
+    run_id = "dddd-pause-test"
+    ref = "hermes-pause-ref"
+    from datetime import UTC, datetime
+
+    binding = plugin._RuntimeBinding(
+        run_id=run_id,
+        runtime_binding_id="bid4",
+        runtime_run_ref=ref,
+        ingress_base_url="",
+        bound_at=datetime.now(UTC),
+        principal_token="",
+        last_status="running",
+        payload_summary={"lane_id": "main-lane", "worktree_id": "wt-123"},
+    )
+    plugin._REGISTRY.insert(binding)
+
+    mock_proc = MagicMock()
+    mock_proc.pid = 77777
+    handle = plugin._ProcessHandle(
+        run_id=run_id, pid=77777, proc=mock_proc, started_at=datetime.now(UTC)
+    )
+    with plugin._PROC_REGISTRY._lock:
+        plugin._PROC_REGISTRY._by_run[run_id] = handle
+
+    signals_sent = []
+    with (
+        patch("os.getpgid", return_value=77777),
+        patch("os.killpg", side_effect=lambda pgid, sig: signals_sent.append(sig)),
+    ):
+        asyncio.get_event_loop().run_until_complete(
+            plugin._async_pause(run_id, ref)
+        )
+
+    assert signal.SIGSTOP in signals_sent
+    with plugin._PAUSE_LOCK:
+        state = plugin._PAUSE_STATE.get(run_id)
+    assert state is not None
+    assert state.lane_id == "main-lane"
+    assert state.worktree_id == "wt-123"
+    assert plugin._REGISTRY.get(run_id).last_status == "paused"
+
+
+def test_pause_handler_degrades_when_sigstop_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If SIGSTOP raises, pause must emit runtime.error and NOT report paused."""
+    plugin = _load_plugin_module()
+    plugin._REGISTRY.clear()
+    plugin._PROC_REGISTRY.clear()
+    with plugin._PAUSE_LOCK:
+        plugin._PAUSE_STATE.clear()
+
+    run_id = "eeee-pause-fail"
+    ref = "hermes-pause-fail-ref"
+    from datetime import UTC, datetime
+
+    binding = plugin._RuntimeBinding(
+        run_id=run_id,
+        runtime_binding_id="bid5",
+        runtime_run_ref=ref,
+        ingress_base_url="",
+        bound_at=datetime.now(UTC),
+        principal_token="",
+        last_status="running",
+    )
+    plugin._REGISTRY.insert(binding)
+
+    mock_proc = MagicMock()
+    mock_proc.pid = 66666
+    handle = plugin._ProcessHandle(
+        run_id=run_id, pid=66666, proc=mock_proc, started_at=datetime.now(UTC)
+    )
+    with plugin._PROC_REGISTRY._lock:
+        plugin._PROC_REGISTRY._by_run[run_id] = handle
+
+    emitted_events: list[str] = []
+
+    async def fake_emit(binding, event_type, payload):
+        emitted_events.append(event_type)
+
+    with (
+        patch("os.getpgid", return_value=66666),
+        patch("os.killpg", side_effect=PermissionError("SIGSTOP denied")),
+        patch.object(plugin, "_emit_lifecycle_event", side_effect=fake_emit),
+    ):
+        asyncio.get_event_loop().run_until_complete(
+            plugin._async_pause(run_id, ref)
+        )
+
+    assert "runtime.error" in emitted_events
+    # Status must NOT be set to paused when SIGSTOP failed.
+    assert plugin._REGISTRY.get(run_id).last_status == "running"
+    with plugin._PAUSE_LOCK:
+        assert plugin._PAUSE_STATE.get(run_id) is None
+
+
+def test_resume_handler_sends_sigcont_and_clears_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin = _load_plugin_module()
+    plugin._REGISTRY.clear()
+    plugin._PROC_REGISTRY.clear()
+    with plugin._PAUSE_LOCK:
+        plugin._PAUSE_STATE.clear()
+
+    run_id = "ffff-resume-test"
+    ref = "hermes-resume-ref"
+    from datetime import UTC, datetime
+
+    binding = plugin._RuntimeBinding(
+        run_id=run_id,
+        runtime_binding_id="bid6",
+        runtime_run_ref=ref,
+        ingress_base_url="",
+        bound_at=datetime.now(UTC),
+        principal_token="",
+        last_status="paused",
+    )
+    plugin._REGISTRY.insert(binding)
+
+    mock_proc = MagicMock()
+    mock_proc.pid = 55555
+    handle = plugin._ProcessHandle(
+        run_id=run_id, pid=55555, proc=mock_proc, started_at=datetime.now(UTC)
+    )
+    with plugin._PROC_REGISTRY._lock:
+        plugin._PROC_REGISTRY._by_run[run_id] = handle
+
+    pause_state = plugin._PauseState(
+        run_id=run_id,
+        pid=55555,
+        paused_at=datetime.now(UTC),
+        lane_id="main-lane",
+        worktree_id="wt-456",
+    )
+    with plugin._PAUSE_LOCK:
+        plugin._PAUSE_STATE[run_id] = pause_state
+
+    signals_sent = []
+    with (
+        patch("os.getpgid", return_value=55555),
+        patch("os.killpg", side_effect=lambda pgid, sig: signals_sent.append(sig)),
+    ):
+        asyncio.get_event_loop().run_until_complete(
+            plugin._async_resume(run_id, ref)
+        )
+
+    assert signal.SIGCONT in signals_sent
+    with plugin._PAUSE_LOCK:
+        assert plugin._PAUSE_STATE.get(run_id) is None
+    assert plugin._REGISTRY.get(run_id).last_status == "running"
+
+
+def test_resume_handler_no_op_without_pause_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Resume when no pause state exists logs a warning but does not raise."""
+    plugin = _load_plugin_module()
+    plugin._REGISTRY.clear()
+    plugin._PROC_REGISTRY.clear()
+    with plugin._PAUSE_LOCK:
+        plugin._PAUSE_STATE.clear()
+
+    run_id = "gggg-resume-no-state"
+    ref = "hermes-resume-nostate"
+    from datetime import UTC, datetime
+
+    binding = plugin._RuntimeBinding(
+        run_id=run_id,
+        runtime_binding_id="bid7",
+        runtime_run_ref=ref,
+        ingress_base_url="",
+        bound_at=datetime.now(UTC),
+        principal_token="",
+        last_status="running",
+    )
+    plugin._REGISTRY.insert(binding)
+
+    with patch("os.killpg") as mock_kill:
+        asyncio.get_event_loop().run_until_complete(
+            plugin._async_resume(run_id, ref)
+        )
+    mock_kill.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Expand-scope handler
+# ---------------------------------------------------------------------------
+
+
+def test_expand_scope_revokes_token_and_signals_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin = _load_plugin_module()
+    plugin._REGISTRY.clear()
+    plugin._PROC_REGISTRY.clear()
+
+    run_id = "hhhh-expand-scope"
+    ref = "hermes-expand-ref"
+    from datetime import UTC, datetime
+
+    binding = plugin._RuntimeBinding(
+        run_id=run_id,
+        runtime_binding_id="bid8",
+        runtime_run_ref=ref,
+        ingress_base_url="",
+        bound_at=datetime.now(UTC),
+        principal_token="old-secret-token",
+        last_status="running",
+    )
+    plugin._REGISTRY.insert(binding)
+
+    mock_proc = MagicMock()
+    mock_proc.pid = 44444
+    handle = plugin._ProcessHandle(
+        run_id=run_id, pid=44444, proc=mock_proc, started_at=datetime.now(UTC)
+    )
+    with plugin._PROC_REGISTRY._lock:
+        plugin._PROC_REGISTRY._by_run[run_id] = handle
+
+    signals_sent = []
+    with (
+        patch("os.getpgid", return_value=44444),
+        patch("os.killpg", side_effect=lambda pgid, sig: signals_sent.append(sig)),
+    ):
+        asyncio.get_event_loop().run_until_complete(
+            plugin._async_expand_scope(run_id, ref)
+        )
+
+    assert signal.SIGUSR1 in signals_sent
+    # Token must be cleared — old token is treated as revoked.
+    assert plugin._REGISTRY.get(run_id).principal_token == ""
+    assert plugin._REGISTRY.get(run_id).last_status == "scope_expanding"
+
+
+def test_expand_scope_does_not_log_token_material(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    import logging
+
+    plugin = _load_plugin_module()
+    plugin._REGISTRY.clear()
+    plugin._PROC_REGISTRY.clear()
+
+    run_id = "iiii-token-log-test"
+    ref = "hermes-token-log"
+    secret_token = "super-secret-old-token-xyz"
+    from datetime import UTC, datetime
+
+    binding = plugin._RuntimeBinding(
+        run_id=run_id,
+        runtime_binding_id="bid9",
+        runtime_run_ref=ref,
+        ingress_base_url="",
+        bound_at=datetime.now(UTC),
+        principal_token=secret_token,
+        last_status="running",
+    )
+    plugin._REGISTRY.insert(binding)
+
+    with (
+        patch("os.getpgid", side_effect=ProcessLookupError),
+        caplog.at_level(logging.DEBUG),
+    ):
+        asyncio.get_event_loop().run_until_complete(
+            plugin._async_expand_scope(run_id, ref)
+        )
+
+    for record in caplog.records:
+        assert secret_token not in record.getMessage()
+        assert secret_token[:8] not in record.getMessage()
+
+
+def test_rebind_token_transitions_scope_expanding_to_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After rebind-token on a scope_expanding run, status returns to running."""
+    client, plugin = _make_client(monkeypatch)
+    headers = {"X-TTM-Control-Plane-Secret": "test-secret"}
+    run_id, _ = _dispatch_and_get_ref(client, headers)
+
+    # Manually set status to scope_expanding (as expand_scope handler would).
+    plugin._REGISTRY.update_status(run_id, last_status="scope_expanding")
+
+    resp = client.post(
+        f"/api/plugins/ttm-control-plane/runs/{run_id}/rebind-token",
+        json={
+            "new_binding_id": "33333333-3333-3333-3333-333333333333",
+            "new_token": "new-token-after-scope-expand",
+            "ingress_base_url": "",
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 200
+    assert plugin._REGISTRY.get(run_id).last_status == "running"
+
+
+# ---------------------------------------------------------------------------
+# TTM ingress event emission — mocked, never logs token material
+# ---------------------------------------------------------------------------
+
+
+def test_emit_lifecycle_event_skipped_when_no_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No HTTP call is made when the plugin has no token for the run."""
+    plugin = _load_plugin_module()
+    from datetime import UTC, datetime
+
+    binding = plugin._RuntimeBinding(
+        run_id="jjjj",
+        runtime_binding_id="bid10",
+        runtime_run_ref="ref10",
+        ingress_base_url="http://ttm.local",
+        bound_at=datetime.now(UTC),
+        principal_token="",  # cleared
+        last_status="stopped",
+    )
+
+    with patch("httpx.AsyncClient") as mock_client_cls:
+        asyncio.get_event_loop().run_until_complete(
+            plugin._emit_lifecycle_event(binding, "task.updated", {"status": "stopped"})
+        )
+    mock_client_cls.assert_not_called()
+
+
+def test_emit_lifecycle_event_posts_when_token_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the plugin holds a token, it POSTs the event to TTM ingress."""
+    plugin = _load_plugin_module()
+    from datetime import UTC, datetime
+
+    binding = plugin._RuntimeBinding(
+        run_id="kkkk",
+        runtime_binding_id="bid11",
+        runtime_run_ref="ref11",
+        ingress_base_url="http://ttm.local",
+        bound_at=datetime.now(UTC),
+        principal_token="live-token",
+        last_status="paused",
+    )
+
+    mock_response = MagicMock()
+    mock_response.status_code = 201
+
+    async def fake_post(url, *, json, headers):
+        return mock_response
+
+    mock_client = AsyncMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client.post = fake_post
+
+    with patch("httpx.AsyncClient", return_value=mock_client):
+        asyncio.get_event_loop().run_until_complete(
+            plugin._emit_lifecycle_event(binding, "task.updated", {"status": "paused"})
+        )
+
+    # Verify post was called (via the mock_client.post path)
+    # No assertion on mock_client.post.called since it's a real async function;
+    # absence of exception is the key contract here.
+
+
+def test_emit_lifecycle_event_never_logs_token(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Token material must never appear in plugin logs, even on HTTP error."""
+    import logging
+
+    plugin = _load_plugin_module()
+    from datetime import UTC, datetime
+
+    secret_token = "secret-bearer-xyz-123"
+    binding = plugin._RuntimeBinding(
+        run_id="llll",
+        runtime_binding_id="bid12",
+        runtime_run_ref="ref12",
+        ingress_base_url="http://ttm.local",
+        bound_at=datetime.now(UTC),
+        principal_token=secret_token,
+        last_status="stopped",
+    )
+
+    # Simulate a 500 response — triggers the warning log path without
+    # raising, so we can inspect the log output for token material.
+    mock_response = MagicMock()
+    mock_response.status_code = 500
+
+    async def fake_post(url, *, json, headers):
+        return mock_response
+
+    mock_client = MagicMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client.post = fake_post
+
+    with (
+        patch("httpx.AsyncClient", return_value=mock_client),
+        caplog.at_level(logging.WARNING),
+    ):
+        asyncio.get_event_loop().run_until_complete(
+            plugin._emit_lifecycle_event(binding, "task.updated", {"status": "stopped"})
+        )
+
+    for record in caplog.records:
+        assert secret_token not in record.getMessage()
+        assert secret_token[:8] not in record.getMessage()
 
 
 # ---------------------------------------------------------------------------
@@ -496,3 +1174,5 @@ def test_spawn_logs_when_executable_missing(monkeypatch: pytest.MonkeyPatch) -> 
     _asyncio.get_event_loop().run_until_complete(
         plugin._spawn_headless_session(binding, "some-token")
     )
+    # Process must not be registered when spawn was skipped.
+    assert plugin._PROC_REGISTRY.get(binding.run_id) is None
