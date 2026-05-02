@@ -25,7 +25,7 @@ from tools.ttm_ingress import (
     IngressNotBoundError,
     IngressServerError,
     TtmIngress,
-    _redact_token,
+    _token_present,
 )
 
 PRINCIPAL_TOKEN = "tok_abcdef0123456789xyz"
@@ -163,31 +163,34 @@ class TestBinding:
 
 
 # ---------------------------------------------------------------------------
-# Token redaction
+# Token logging — only a presence marker, never the value or a prefix
 # ---------------------------------------------------------------------------
 
 
-class TestRedaction:
-    def test_redact_long_token(self):
-        assert _redact_token("tok_abcdef0123456789") == "tok_abcd…"
+class TestTokenPresenceLogging:
+    def test_present_when_set(self):
+        assert _token_present("tok_abcdef0123456789") == "set"
 
-    def test_redact_short_token(self):
-        assert _redact_token("tiny") == "ti…"
+    def test_present_when_short(self):
+        assert _token_present("tiny") == "set"
 
-    def test_redact_empty(self):
-        assert _redact_token("") == ""
+    def test_unset_when_empty(self):
+        assert _token_present("") == "unset"
 
-    def test_token_never_logged_in_plaintext(self, caplog):
+    def test_token_value_and_prefix_never_logged(self, caplog):
+        # Even a partial prefix would be unsafe in long-running production
+        # logs (post-mortem leakage). The presence marker is the only
+        # token-derived signal we emit.
         factory, _ = _client_factory([_StubResponse(201, {"event_id": "ev-1"})])
         ttm = TtmIngress(client_factory=factory)
         _bind(ttm)
         with caplog.at_level(logging.DEBUG, logger="tools.ttm_ingress"):
             ttm.post_event(RUN_ID, EVENT_TASK_UPDATED, {"x": 1})
         for record in caplog.records:
-            assert PRINCIPAL_TOKEN not in record.getMessage()
-        # The redacted prefix should appear at least once at DEBUG level
-        # so operators can correlate which token was used.
-        assert any("tok_abcd" in r.getMessage() for r in caplog.records)
+            msg = record.getMessage()
+            assert PRINCIPAL_TOKEN not in msg
+            assert PRINCIPAL_TOKEN[:8] not in msg
+            assert "tok_abcd" not in msg
 
 
 # ---------------------------------------------------------------------------

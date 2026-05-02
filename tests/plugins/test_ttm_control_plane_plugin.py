@@ -56,21 +56,34 @@ def _load_plugin_module():
     return mod
 
 
-def _make_client(monkeypatch: pytest.MonkeyPatch, *, secret: str | None = "test-secret"):
+def _make_client(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    secret: str | None = "test-secret",
+    db_path: Path | None = None,
+):
     """Build a fresh FastAPI app with the plugin mounted under
     ``/api/plugins/ttm-control-plane`` and the registry cleared.
 
     ``monkeypatch`` sets the env var so each test sees the auth model it
-    expects without leaking state across tests.
+    expects without leaking state across tests. The SQLite-backed
+    binding registry is pointed at a per-test ``db_path`` (or a
+    process-wide test path when none is given) so persistence does not
+    leak across tests.
     """
     if secret is None:
         monkeypatch.delenv("TTM_CONTROL_PLANE_SECRET", raising=False)
     else:
         monkeypatch.setenv("TTM_CONTROL_PLANE_SECRET", secret)
+    if db_path is None:
+        # Default test DB path — wiped via registry.clear() below.
+        db_path = Path(__file__).resolve().parent / "_test_ttm_control_plane.db"
+    monkeypatch.setenv("TTM_CONTROL_PLANE_DB_PATH", str(db_path))
+    # Disable subprocess spawn for the vast majority of tests — only
+    # the dedicated spawn-path tests opt back in.
+    monkeypatch.setenv("TTM_CONTROL_PLANE_DISABLE_SPAWN", "1")
     plugin = _load_plugin_module()
-    # Each test gets a clean registry — the singleton persists across
-    # imports within a single process, so we wipe it here.
-    plugin._REGISTRY._by_run.clear()  # type: ignore[attr-defined]
+    plugin._REGISTRY.clear()
     app = FastAPI()
     app.include_router(plugin.router, prefix="/api/plugins/ttm-control-plane")
     return TestClient(app), plugin
@@ -378,3 +391,108 @@ def test_rebind_token_does_not_log_token_material(
         assert secret_token not in line
         # No prefix either (first 8 chars).
         assert secret_token[:8] not in line
+
+
+# ---------------------------------------------------------------------------
+# SQLite persistence — bindings survive a fresh registry instance, tokens do not
+# ---------------------------------------------------------------------------
+
+
+def test_binding_persists_across_registry_instances(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Dispatch on instance A; rebuilding the registry against the same DB
+    must surface the same binding (without the principal token)."""
+    db_path = tmp_path / "bindings.db"
+    client, plugin = _make_client(monkeypatch, db_path=db_path)
+    headers = {"X-TTM-Control-Plane-Secret": "test-secret"}
+
+    dispatched = client.post(
+        "/api/plugins/ttm-control-plane/runs/dispatch",
+        json=_dispatch_body(),
+        headers=headers,
+    )
+    assert dispatched.status_code == 202, dispatched.text
+    expected_ref = dispatched.json()["runtime_run_ref"]
+    expected_run_id = "11111111-1111-1111-1111-111111111111"
+
+    # Simulate a dashboard restart: drop the in-memory registry and
+    # rebuild from the same DB path.
+    rebuilt = plugin._BindingRegistry(db_path=str(db_path))
+    snapshot = rebuilt.snapshot()
+    assert len(snapshot) == 1
+    survived = snapshot[0]
+    assert survived.run_id == expected_run_id
+    assert survived.runtime_run_ref == expected_ref
+    # Token must NEVER persist — only the binding metadata.
+    assert survived.principal_token == ""
+
+
+def test_binding_remove_clears_persistence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    db_path = tmp_path / "bindings.db"
+    client, plugin = _make_client(monkeypatch, db_path=db_path)
+    headers = {"X-TTM-Control-Plane-Secret": "test-secret"}
+    run_id = "11111111-1111-1111-1111-111111111111"
+
+    client.post(
+        "/api/plugins/ttm-control-plane/runs/dispatch",
+        json=_dispatch_body(),
+        headers=headers,
+    )
+    plugin._REGISTRY.remove(run_id)
+
+    rebuilt = plugin._BindingRegistry(db_path=str(db_path))
+    assert rebuilt.snapshot() == []
+
+
+# ---------------------------------------------------------------------------
+# Headless session spawn — opt-in path
+# ---------------------------------------------------------------------------
+
+
+def test_spawn_no_op_when_disabled(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    import logging
+
+    client, plugin = _make_client(monkeypatch)
+    headers = {"X-TTM-Control-Plane-Secret": "test-secret"}
+    with caplog.at_level(logging.INFO, logger="hermes_dashboard_plugin_ttm_control_plane_test"):
+        client.post(
+            "/api/plugins/ttm-control-plane/runs/dispatch",
+            json=_dispatch_body(),
+            headers=headers,
+        )
+    # Either the spawn task hasn't fired yet (we did not await it) or it
+    # fired and no-op'd because TTM_CONTROL_PLANE_DISABLE_SPAWN=1. We
+    # assert the latter never produced a "spawned" log line.
+    spawned = [r for r in caplog.records if "headless_session.spawned" in r.getMessage()]
+    assert not spawned
+
+
+def test_spawn_logs_when_executable_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When neither HERMES_CLI nor PATH resolves a hermes binary, the
+    spawn must log-and-skip — never crash the dispatch."""
+    import asyncio as _asyncio
+
+    monkeypatch.delenv("TTM_CONTROL_PLANE_DISABLE_SPAWN", raising=False)
+    monkeypatch.setenv("HERMES_CLI", "/definitely/does/not/exist/hermes")
+    monkeypatch.setenv("PATH", "")  # zero out PATH lookup
+    monkeypatch.setenv("TTM_CONTROL_PLANE_SECRET", "test-secret")
+    plugin = _load_plugin_module()
+    plugin._REGISTRY.clear()
+
+    binding = plugin._RuntimeBinding(
+        run_id="11111111-1111-1111-1111-111111111111",
+        runtime_binding_id="binding-1",
+        runtime_run_ref="hermes-test-1",
+        ingress_base_url="http://127.0.0.1:8000",
+        bound_at=plugin._utcnow(),
+        principal_token="some-token",
+    )
+    # Should not raise even though the executable is unfindable.
+    _asyncio.get_event_loop().run_until_complete(
+        plugin._spawn_headless_session(binding, "some-token")
+    )
