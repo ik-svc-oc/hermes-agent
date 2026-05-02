@@ -26,6 +26,19 @@ Per ``RUNTIME-PRINCIPAL-CONTRACT.md``, the ``principal_token`` lives in
 the dispatch body and MUST be forwarded as ``Authorization: Bearer
 <token>`` on every ingress write-back to TTM. Plaintext never appears
 in plugin logs or in the runtime registry.
+
+H6 adds lifecycle control (stop/pause/resume/expand_scope) via:
+  POST /runs/{ref}/lifecycle   — unified lifecycle receiver (202 async)
+  POST /runs/{ref}/stop        — compat alias for stop (TTM adapter pre-H6)
+
+Stop:  SIGTERM → 10s wait → SIGKILL; emits task.updated{stopped}.
+Pause: SIGSTOP; persists dossier state; emits task.updated{paused}.
+       Degrades explicitly if platform SIGSTOP is unavailable.
+Resume: SIGCONT from saved pause state; emits task.updated{active}.
+Expand-scope: revokes old token; SIGUSR1 advisory hint; awaits
+              rebind-token to restore emission with new epoch.
+
+Hermes never self-approves run closure. That remains TTM's domain.
 """
 
 import asyncio
@@ -33,13 +46,14 @@ import json
 import logging
 import os
 import shutil
+import signal
 import sqlite3
 import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 from fastapi import APIRouter, Header, HTTPException, Request, status
@@ -260,6 +274,79 @@ _REGISTRY = _BindingRegistry()
 
 
 # ---------------------------------------------------------------------------
+# Process registry — tracks live headless session PIDs for lifecycle control
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _ProcessHandle:
+    """Lightweight reference to a running headless session subprocess."""
+
+    run_id: str
+    pid: int
+    proc: Any  # asyncio.subprocess.Process — event-loop-bound
+    started_at: datetime
+
+
+class _ProcessRegistry:
+    """Thread-safe registry of live headless session process handles.
+
+    Registered at spawn time; removed when the process exits or the stop
+    handler completes. Separate from the binding registry so the binding
+    (and its status history) outlives the process.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._by_run: dict[str, _ProcessHandle] = {}
+
+    def register(self, run_id: str, proc: Any) -> None:
+        with self._lock:
+            self._by_run[run_id] = _ProcessHandle(
+                run_id=run_id,
+                pid=proc.pid,
+                proc=proc,
+                started_at=_utcnow(),
+            )
+
+    def get(self, run_id: str) -> _ProcessHandle | None:
+        with self._lock:
+            return self._by_run.get(run_id)
+
+    def remove(self, run_id: str) -> None:
+        with self._lock:
+            self._by_run.pop(run_id, None)
+
+    def clear(self) -> None:
+        """Wipe all handles. Test-only."""
+        with self._lock:
+            self._by_run.clear()
+
+
+_PROC_REGISTRY = _ProcessRegistry()
+
+
+# ---------------------------------------------------------------------------
+# Pause-state dossier — persists per-run context across pause/resume
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _PauseState:
+    """Dossier snapshot saved when a run is paused via SIGSTOP."""
+
+    run_id: str
+    pid: int
+    paused_at: datetime
+    lane_id: str = ""
+    worktree_id: str = ""
+
+
+_PAUSE_STATE: dict[str, _PauseState] = {}
+_PAUSE_LOCK = threading.Lock()
+
+
+# ---------------------------------------------------------------------------
 # Wire schemas — mirror RuntimeDispatchPayload / RuntimeDispatchResult
 # ---------------------------------------------------------------------------
 
@@ -327,6 +414,28 @@ class RebindTokenRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Lifecycle wire schemas (H6)
+# ---------------------------------------------------------------------------
+
+LifecycleAction = Literal["stop", "pause", "resume", "expand_scope"]
+
+
+class LifecycleRequest(BaseModel):
+    """Body for POST /runs/{ref}/lifecycle."""
+
+    action: LifecycleAction
+
+
+class LifecycleResponse(BaseModel):
+    """Immediate 202 response — action is processed asynchronously."""
+
+    status: str
+    runtime_run_ref: str
+    action: str
+    accepted_at: datetime
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -352,6 +461,14 @@ def _payload_summary(payload: DispatchPayload) -> dict[str, Any]:
         "required_tests_count": len(payload.required_tests),
         "goal_len": len(payload.goal),
     }
+
+
+def _binding_by_ref(runtime_run_ref: str) -> _RuntimeBinding | None:
+    """Look up a binding by runtime_run_ref (O(n) scan over the small registry)."""
+    return next(
+        (b for b in _REGISTRY.snapshot() if b.runtime_run_ref == runtime_run_ref),
+        None,
+    )
 
 
 async def _post_run_dispatched(binding: _RuntimeBinding) -> None:
@@ -420,6 +537,62 @@ async def _post_run_dispatched(binding: _RuntimeBinding) -> None:
         _REGISTRY.clear_token(binding.run_id)
 
 
+async def _emit_lifecycle_event(
+    binding: _RuntimeBinding,
+    event_type: str,
+    payload: dict[str, Any],
+) -> None:
+    """POST a canonical event to TTM ingress if a principal token is available.
+
+    Skipped when the token is absent (cleared post-dispatch or after scope
+    revocation). The headless agent process owns its own token copy and will
+    emit lifecycle events independently via the ttm_ingress skill.
+    Never logs token material.
+    """
+    base = (binding.ingress_base_url or "").rstrip("/")
+    token = binding.principal_token
+    if not base or not token:
+        logger.debug(
+            "ttm-control-plane.lifecycle_event.skipped event_type=%s run_id=%s "
+            "(no ingress_base_url or token not held by plugin)",
+            event_type,
+            binding.run_id,
+        )
+        return
+
+    url = f"{base}/api/ingress/runtime/hermes/events"
+    body = {
+        "event_type": event_type,
+        "actor_type": "runtime",
+        "actor_id": "hermes",
+        "expected_scope_epoch": 1,
+        "summary": f"Hermes lifecycle: {event_type}",
+        "payload": payload,
+    }
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "X-Runtime-Id": "hermes",
+        "X-Run-Id": binding.run_id,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(url, json=body, headers=headers)
+            if resp.status_code >= 400:
+                logger.warning(
+                    "ttm-control-plane.lifecycle_event.failed event_type=%s run_id=%s status=%s",
+                    event_type,
+                    binding.run_id,
+                    resp.status_code,
+                )
+    except httpx.HTTPError as exc:
+        logger.warning(
+            "ttm-control-plane.lifecycle_event.error event_type=%s run_id=%s error=%s",
+            event_type,
+            binding.run_id,
+            exc,
+        )
+
+
 _SPAWN_LOG_DIR = os.path.expanduser(
     os.environ.get("TTM_CONTROL_PLANE_LOG_DIR", "~/.hermes/logs/runs")
 )
@@ -457,6 +630,8 @@ async def _spawn_headless_session(binding: _RuntimeBinding, principal_token: str
 
     The child is intentionally NOT awaited: the dispatch route already
     returned 202 and the agent runs for the lifetime of the run.
+    The process handle is registered in ``_PROC_REGISTRY`` for lifecycle
+    control (stop/pause/resume).
     """
     if os.environ.get(_SPAWN_DISABLED_ENV, "").strip().lower() in {"1", "true", "yes"}:
         logger.info(
@@ -536,6 +711,7 @@ async def _spawn_headless_session(binding: _RuntimeBinding, principal_token: str
         )
         return
 
+    _PROC_REGISTRY.register(binding.run_id, proc)
     logger.info(
         "ttm-control-plane.headless_session.spawned run_id=%s pid=%s log=%s",
         binding.run_id,
@@ -559,6 +735,275 @@ def _kick_off_post_dispatch_tasks(binding: _RuntimeBinding) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Lifecycle action handlers (H6) — called off the request loop as Tasks
+# ---------------------------------------------------------------------------
+
+
+async def _kill_run_process(
+    run_id: str,
+    *,
+    term_timeout: float = 10.0,
+) -> None:
+    """SIGTERM the headless session process group, then SIGKILL on timeout.
+
+    Safe to call when no process is registered (logs and returns).
+    Cleans up the process handle from ``_PROC_REGISTRY`` on completion.
+    """
+    handle = _PROC_REGISTRY.get(run_id)
+    if handle is None:
+        return
+
+    try:
+        pgid = os.getpgid(handle.pid)
+    except ProcessLookupError:
+        _PROC_REGISTRY.remove(run_id)
+        return
+
+    # SIGTERM — give the process a chance to flush state and exit cleanly.
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+        logger.info(
+            "ttm-control-plane.kill.sigterm run_id=%s pid=%s pgid=%s",
+            run_id,
+            handle.pid,
+            pgid,
+        )
+    except (ProcessLookupError, PermissionError) as exc:
+        logger.warning(
+            "ttm-control-plane.kill.sigterm_failed run_id=%s error=%s",
+            run_id,
+            exc,
+        )
+        _PROC_REGISTRY.remove(run_id)
+        return
+
+    # Wait up to term_timeout for graceful exit.
+    try:
+        await asyncio.wait_for(handle.proc.wait(), timeout=term_timeout)
+    except asyncio.TimeoutError:
+        pass
+
+    # SIGKILL any survivors.
+    if handle.proc.returncode is None:
+        logger.info(
+            "ttm-control-plane.kill.sigkill run_id=%s pid=%s (SIGTERM timeout)",
+            run_id,
+            handle.pid,
+        )
+        try:
+            os.killpg(os.getpgid(handle.pid), signal.SIGKILL)
+            await asyncio.wait_for(handle.proc.wait(), timeout=5.0)
+        except (ProcessLookupError, asyncio.TimeoutError, PermissionError):
+            pass
+
+    _PROC_REGISTRY.remove(run_id)
+
+
+async def _async_stop(run_id: str, runtime_run_ref: str) -> None:
+    """Stop the headless session: kill process, emit event, update status.
+
+    Hermes reports stop completion via task.updated{status: stopped} but
+    does NOT self-approve run closure — that remains TTM's domain and
+    requires a granted close approval on TTM's side.
+    The binding is kept (status="stopped") so TTM can query status and
+    drive the canonical closure cascade independently.
+    """
+    binding = _REGISTRY.get(run_id)
+    if binding is None:
+        logger.warning("ttm-control-plane.stop.no_binding run_id=%s", run_id)
+        return
+
+    await _kill_run_process(run_id)
+
+    await _emit_lifecycle_event(
+        binding,
+        "task.updated",
+        {"status": "stopped", "runtime_run_ref": runtime_run_ref},
+    )
+    _REGISTRY.update_status(run_id, last_status="stopped")
+    logger.info(
+        "ttm-control-plane.stop.complete run_id=%s runtime_run_ref=%s",
+        run_id,
+        runtime_run_ref,
+    )
+
+
+async def _async_pause(run_id: str, runtime_run_ref: str) -> None:
+    """Pause the headless session with SIGSTOP; persist dossier state.
+
+    Degrades explicitly if SIGSTOP is unavailable or the process is gone —
+    does NOT silently report paused when the suspend did not happen.
+    """
+    binding = _REGISTRY.get(run_id)
+    if binding is None:
+        logger.warning("ttm-control-plane.pause.no_binding run_id=%s", run_id)
+        return
+
+    handle = _PROC_REGISTRY.get(run_id)
+    if handle is None:
+        logger.info(
+            "ttm-control-plane.pause.no_process run_id=%s "
+            "(process not registered; spawn may be disabled or run already finished)",
+            run_id,
+        )
+        return
+
+    try:
+        pgid = os.getpgid(handle.pid)
+        os.killpg(pgid, signal.SIGSTOP)
+    except (ProcessLookupError, PermissionError, AttributeError) as exc:
+        # SIGSTOP is not available on this platform or the process is gone.
+        # Degrade explicitly — never report paused when suspend did not happen.
+        logger.warning(
+            "ttm-control-plane.pause.unsupported run_id=%s error=%s "
+            "(SIGSTOP unavailable or process gone; reporting runtime.error)",
+            run_id,
+            exc,
+        )
+        await _emit_lifecycle_event(
+            binding,
+            "runtime.error",
+            {
+                "phase": "pause",
+                "detail": f"pause_unsupported: {exc}",
+                "runtime_run_ref": runtime_run_ref,
+            },
+        )
+        return
+
+    summary = binding.payload_summary
+    state = _PauseState(
+        run_id=run_id,
+        pid=handle.pid,
+        paused_at=_utcnow(),
+        lane_id=summary.get("lane_id", ""),
+        worktree_id=summary.get("worktree_id", ""),
+    )
+    with _PAUSE_LOCK:
+        _PAUSE_STATE[run_id] = state
+
+    await _emit_lifecycle_event(
+        binding,
+        "task.updated",
+        {
+            "status": "paused",
+            "runtime_run_ref": runtime_run_ref,
+            "paused_at": state.paused_at.isoformat(),
+            "lane_id": state.lane_id,
+            "worktree_id": state.worktree_id,
+        },
+    )
+    _REGISTRY.update_status(run_id, last_status="paused")
+    logger.info(
+        "ttm-control-plane.pause.complete run_id=%s pid=%s",
+        run_id,
+        handle.pid,
+    )
+
+
+async def _async_resume(run_id: str, runtime_run_ref: str) -> None:
+    """Resume a SIGSTOP-paused session with SIGCONT; restore dossier state."""
+    binding = _REGISTRY.get(run_id)
+    if binding is None:
+        logger.warning("ttm-control-plane.resume.no_binding run_id=%s", run_id)
+        return
+
+    with _PAUSE_LOCK:
+        state = _PAUSE_STATE.get(run_id)
+
+    if state is None:
+        logger.warning(
+            "ttm-control-plane.resume.no_pause_state run_id=%s "
+            "(run was not paused via this plugin instance or state was lost on restart)",
+            run_id,
+        )
+        return
+
+    handle = _PROC_REGISTRY.get(run_id)
+    if handle is None:
+        logger.warning(
+            "ttm-control-plane.resume.no_process run_id=%s "
+            "(process handle lost since pause; cannot resume)",
+            run_id,
+        )
+        return
+
+    try:
+        pgid = os.getpgid(handle.pid)
+        os.killpg(pgid, signal.SIGCONT)
+    except (ProcessLookupError, PermissionError, AttributeError) as exc:
+        logger.warning(
+            "ttm-control-plane.resume.failed run_id=%s error=%s",
+            run_id,
+            exc,
+        )
+        return
+
+    with _PAUSE_LOCK:
+        _PAUSE_STATE.pop(run_id, None)
+
+    await _emit_lifecycle_event(
+        binding,
+        "task.updated",
+        {"status": "active", "runtime_run_ref": runtime_run_ref},
+    )
+    _REGISTRY.update_status(run_id, last_status="running")
+    logger.info(
+        "ttm-control-plane.resume.complete run_id=%s pid=%s",
+        run_id,
+        handle.pid,
+    )
+
+
+async def _async_expand_scope(run_id: str, runtime_run_ref: str) -> None:
+    """Handle scope expansion: revoke old token and signal headless process.
+
+    The old principal_token is treated as revoked immediately. SIGUSR1 is
+    sent as an advisory hint to the process group to checkpoint (the agent
+    will also detect 401 on its next ingress write if it hasn't stopped).
+    The new token arrives separately via POST /runs/{run_id}/rebind-token;
+    once received the headless agent's next get_run_state() call will yield
+    the new scope_epoch and the agent resets phase state per contract.
+    Invalidated lanes/worktrees must be abandoned — the agent is responsible
+    for detecting the epoch change and stopping work on stale lanes.
+    """
+    binding = _REGISTRY.get(run_id)
+    if binding is None:
+        logger.warning("ttm-control-plane.expand_scope.no_binding run_id=%s", run_id)
+        return
+
+    # Advisory SIGUSR1 before revoking the token so the agent can
+    # checkpoint cleanly before its next write attempt gets a 401.
+    handle = _PROC_REGISTRY.get(run_id)
+    if handle is not None:
+        try:
+            pgid = os.getpgid(handle.pid)
+            os.killpg(pgid, signal.SIGUSR1)
+            logger.info(
+                "ttm-control-plane.expand_scope.sigusr1 run_id=%s pid=%s",
+                run_id,
+                handle.pid,
+            )
+        except (ProcessLookupError, PermissionError) as exc:
+            logger.debug(
+                "ttm-control-plane.expand_scope.sigusr1_failed run_id=%s error=%s",
+                run_id,
+                exc,
+            )
+
+    # Revoke: clear the token from the plugin registry so plugin-level events
+    # stop using it. The headless agent's env-var copy will receive a 401 on
+    # its next ingress write and must stop emitting on the old token.
+    _REGISTRY.clear_token(run_id)
+    _REGISTRY.update_status(run_id, last_status="scope_expanding")
+    logger.info(
+        "ttm-control-plane.expand_scope.token_revoked run_id=%s "
+        "(awaiting rebind-token to restore emission with new scope_epoch)",
+        run_id,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 
@@ -568,7 +1013,7 @@ async def health() -> HealthResponse:
     """Liveness + binding count. Unauthenticated for ops probes."""
     return HealthResponse(
         plugin="ttm-control-plane",
-        version="0.1.0",
+        version="0.2.0",
         auth_enforced=bool(_expected_secret()),
         bindings=len(_REGISTRY.snapshot()),
         checked_at=_utcnow(),
@@ -686,35 +1131,96 @@ async def runtime_run_status(
     )
 
 
+@router.post("/runs/{runtime_run_ref}/lifecycle", status_code=status.HTTP_202_ACCEPTED)
+async def lifecycle_action(
+    runtime_run_ref: str,
+    body: LifecycleRequest,
+    x_ttm_control_plane_secret: str | None = Header(default=None, alias=_SECRET_HEADER),
+) -> LifecycleResponse:
+    """Unified lifecycle receiver: stop | pause | resume | expand_scope.
+
+    Returns 202 immediately; the action is processed asynchronously.
+    Validates that runtime_run_ref maps to a known persisted binding.
+    Principal tokens are never logged.
+
+    Actions:
+      stop         — SIGTERM → 10s → SIGKILL; emits task.updated{stopped}.
+                     Does not self-approve closure; TTM drives canonical close.
+      pause        — SIGSTOP process group; persists dossier; emits task.updated{paused}.
+                     Degrades explicitly if platform SIGSTOP unavailable.
+      resume       — SIGCONT from saved pause state; emits task.updated{active}.
+      expand_scope — Revokes old token; SIGUSR1 hint; awaits rebind-token.
+    """
+    _require_secret(x_ttm_control_plane_secret)
+
+    binding = _binding_by_ref(runtime_run_ref)
+    if binding is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"reason": "runtime_run_ref_not_found"},
+        )
+
+    run_id = binding.run_id
+    loop = asyncio.get_running_loop()
+    match body.action:
+        case "stop":
+            loop.create_task(_async_stop(run_id, runtime_run_ref))
+        case "pause":
+            loop.create_task(_async_pause(run_id, runtime_run_ref))
+        case "resume":
+            loop.create_task(_async_resume(run_id, runtime_run_ref))
+        case "expand_scope":
+            loop.create_task(_async_expand_scope(run_id, runtime_run_ref))
+
+    logger.info(
+        "ttm-control-plane.lifecycle.accepted action=%s run_id=%s runtime_run_ref=%s",
+        body.action,
+        run_id,
+        runtime_run_ref,
+    )
+    return LifecycleResponse(
+        status="accepted",
+        runtime_run_ref=runtime_run_ref,
+        action=body.action,
+        accepted_at=_utcnow(),
+    )
+
+
 @router.post("/runs/{runtime_run_ref}/stop", status_code=status.HTTP_202_ACCEPTED)
 async def stop_run(
     runtime_run_ref: str,
     x_ttm_control_plane_secret: str | None = Header(default=None, alias=_SECRET_HEADER),
 ) -> dict[str, Any]:
-    """Tear down the binding so a follow-on dispatch can rebind cleanly.
+    """Compatibility stop route for current TTM HermesAdapter.
 
-    The headless agent process (when wired in the follow-up) is signalled
-    here; for now we just drop the registry entry.
+    TTM's stop_run() POSTs to /runs/{ref}/stop (not /lifecycle) until the
+    TTM adapter is updated to use /runs/{ref}/lifecycle with action="stop".
+    This route is a stable alias: it schedules the same async stop handler
+    and returns 202 immediately. The binding is kept (status="stopped") so
+    TTM can still query status and drive canonical closure independently.
     """
     _require_secret(x_ttm_control_plane_secret)
 
-    for binding in _REGISTRY.snapshot():
-        if binding.runtime_run_ref == runtime_run_ref:
-            _REGISTRY.remove(binding.run_id)
-            logger.info(
-                "ttm-control-plane.stop run_id=%s runtime_run_ref=%s",
-                binding.run_id,
-                runtime_run_ref,
-            )
-            return {
-                "status": "stopped",
-                "runtime_run_ref": runtime_run_ref,
-                "stopped_at": _utcnow().isoformat(),
-            }
-    raise HTTPException(
-        status_code=status.HTTP_404_NOT_FOUND,
-        detail={"reason": "runtime_run_ref_not_found"},
+    binding = _binding_by_ref(runtime_run_ref)
+    if binding is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"reason": "runtime_run_ref_not_found"},
+        )
+
+    loop = asyncio.get_running_loop()
+    loop.create_task(_async_stop(binding.run_id, runtime_run_ref))
+
+    logger.info(
+        "ttm-control-plane.stop run_id=%s runtime_run_ref=%s",
+        binding.run_id,
+        runtime_run_ref,
     )
+    return {
+        "status": "accepted",
+        "runtime_run_ref": runtime_run_ref,
+        "accepted_at": _utcnow().isoformat(),
+    }
 
 
 @router.post("/runs/{run_id}/rebind-token", status_code=status.HTTP_200_OK)
@@ -741,6 +1247,13 @@ async def rebind_token(
             status_code=status.HTTP_404_NOT_FOUND,
             detail={"reason": "run_not_found"},
         )
+
+    # If we were in scope_expanding state, transition back to running now
+    # that we have a fresh token. The headless agent's next get_run_state()
+    # call will fetch the new scope_epoch and reset phase state per contract.
+    binding = _REGISTRY.get(run_id)
+    if binding is not None and binding.last_status == "scope_expanding":
+        _REGISTRY.update_status(run_id, last_status="running")
 
     logger.info(
         "ttm-control-plane.rebind-token run_id=%s binding_id=%s",
