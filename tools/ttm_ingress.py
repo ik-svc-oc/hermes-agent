@@ -806,3 +806,278 @@ __all__ = [
     "unbind_run",
     "update_scope_epoch",
 ]
+
+# ---------------------------------------------------------------------------
+# Hermes tool registry — expose TTM ingress operations as first-class tools.
+#
+# ``_module_registers_tools()`` in tools/registry.py detects registrations by
+# scanning for bare ``registry.register(...)`` calls at the module body level
+# (AST tree.body). To satisfy that scanner we import under the name ``registry``
+# (no underscore) and fall back to a no-op stub when running outside the agent
+# runtime, so the module-level register() calls never raise AttributeError.
+# ---------------------------------------------------------------------------
+try:
+    from tools.registry import registry  # type: ignore[import]
+except ImportError:
+    class _NoOpRegistry:  # type: ignore[no-redef]
+        def register(self, **kw: Any) -> None:  # noqa: D102
+            pass
+    registry = _NoOpRegistry()  # type: ignore[assignment]
+
+
+def _handle_ttm_ingress_bind(args: dict, **_kw: Any) -> dict:
+    run_id = bind_run_from_env()
+    if run_id is None:
+        return {
+            "ok": False,
+            "reason": (
+                "Missing one or more required env vars: "
+                "TTM_RUN_ID, TTM_PRINCIPAL_TOKEN, TTM_INGRESS_BASE_URL"
+            ),
+        }
+    return {"ok": True, "run_id": run_id}
+
+
+def _handle_ttm_ingress_post_event(args: dict, **_kw: Any) -> dict:
+    event_id = post_event(
+        args["run_id"],
+        args["event_type"],
+        args.get("payload") or {},
+        summary=args.get("summary"),
+    )
+    return {"event_id": event_id}
+
+
+def _handle_ttm_ingress_request_approval(args: dict, **_kw: Any) -> dict:
+    approval_id = request_approval(
+        args["run_id"],
+        args["approval_type"],
+        args["summary"],
+        notes_ref=args.get("notes_ref"),
+        payload=args.get("payload") or {},
+    )
+    return {"approval_id": approval_id}
+
+
+def _handle_ttm_ingress_post_evidence(args: dict, **_kw: Any) -> dict:
+    evidence_id = post_evidence(
+        args["run_id"],
+        args["kind"],
+        args["subject"],
+        args["content_hash"],
+        args["storage_ref"],
+        args["source_event_id"],
+        args["verdict"],
+        verification_status=args.get("verification_status", "passed"),
+    )
+    return {"evidence_id": evidence_id}
+
+
+def _handle_ttm_ingress_get_state(args: dict, **_kw: Any) -> dict:
+    return get_run_state(args["run_id"])
+
+
+_CANONICAL_TYPES_LIST = ", ".join(sorted(CANONICAL_EVENT_TYPES))
+
+registry.register(
+    name="ttm_ingress_bind",
+    toolset="ttm_ingress",
+    schema={
+        "name": "ttm_ingress_bind",
+        "description": (
+            "Initialize the TTM ingress connection for this headless Hermes session. "
+            "Reads TTM_RUN_ID, TTM_PRINCIPAL_TOKEN, and TTM_INGRESS_BASE_URL from the "
+            "process environment (set automatically by the dispatch spawn). "
+            "Call this ONCE at session start before any other ttm_ingress_* tools. "
+            "Returns {ok, run_id}."
+        ),
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+    handler=_handle_ttm_ingress_bind,
+    check_fn=None,
+    is_async=False,
+    emoji="🔗",
+    description="Bind the TTM ingress context from env vars (call once at session start).",
+)
+
+registry.register(
+    name="ttm_ingress_post_event",
+    toolset="ttm_ingress",
+    schema={
+        "name": "ttm_ingress_post_event",
+        "description": (
+            "Append a canonical event to the TTM control-plane run. "
+            f"Canonical event_type values: {_CANONICAL_TYPES_LIST}. "
+            "Returns {{event_id}} — save the id if you will attach evidence to this event."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "run_id": {
+                    "type": "string",
+                    "description": "TTM run UUID (returned by ttm_ingress_bind).",
+                },
+                "event_type": {
+                    "type": "string",
+                    "description": (
+                        f"Canonical event type. Use one of: {_CANONICAL_TYPES_LIST}"
+                    ),
+                },
+                "summary": {
+                    "type": "string",
+                    "description": (
+                        "Human-readable summary shown in the operator dashboard "
+                        "(max 1000 chars)."
+                    ),
+                },
+                "payload": {
+                    "type": "object",
+                    "description": "Optional event payload (arbitrary JSON).",
+                },
+            },
+            "required": ["run_id", "event_type", "summary"],
+        },
+    },
+    handler=_handle_ttm_ingress_post_event,
+    check_fn=None,
+    is_async=False,
+    emoji="📤",
+    description="Append a canonical event record to the TTM run.",
+)
+
+registry.register(
+    name="ttm_ingress_request_approval",
+    toolset="ttm_ingress",
+    schema={
+        "name": "ttm_ingress_request_approval",
+        "description": (
+            "Open an approval gate for operator review in the GOS dashboard. "
+            "After calling this, poll ttm_ingress_get_state to detect the operator "
+            "decision (check approvals[].status for 'granted' or 'rejected'). "
+            "Returns {{approval_id}}."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "run_id": {
+                    "type": "string",
+                    "description": "TTM run UUID.",
+                },
+                "approval_type": {
+                    "type": "string",
+                    "description": (
+                        "Gate identifier, e.g. 'scope', 'contract_lock', 'deployment'. "
+                        "Must match a gate listed in the run's approval_policy."
+                    ),
+                },
+                "summary": {
+                    "type": "string",
+                    "description": (
+                        "Human-facing description of what the operator is asked to approve "
+                        "(max 1000 chars)."
+                    ),
+                },
+                "notes_ref": {
+                    "type": "string",
+                    "description": "Optional URI pointing to supporting notes or artifact.",
+                },
+                "payload": {
+                    "type": "object",
+                    "description": "Optional metadata attached to the gate entry.",
+                },
+            },
+            "required": ["run_id", "approval_type", "summary"],
+        },
+    },
+    handler=_handle_ttm_ingress_request_approval,
+    check_fn=None,
+    is_async=False,
+    emoji="🔏",
+    description="Open a TTM approval gate for operator decision.",
+)
+
+registry.register(
+    name="ttm_ingress_post_evidence",
+    toolset="ttm_ingress",
+    schema={
+        "name": "ttm_ingress_post_evidence",
+        "description": (
+            "Attach a content-addressed evidence artifact to a prior event. "
+            "source_event_id must be an event_id returned by ttm_ingress_post_event "
+            "in the same run. content_hash must be the SHA-256 hex digest (64 chars). "
+            "Returns {{evidence_id}}."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "run_id": {"type": "string", "description": "TTM run UUID."},
+                "kind": {
+                    "type": "string",
+                    "description": "Artifact kind, e.g. 'test_report', 'diff', 'screenshot', 'log'.",
+                },
+                "subject": {
+                    "type": "string",
+                    "description": "Short description of the artifact (max 500 chars).",
+                },
+                "content_hash": {
+                    "type": "string",
+                    "description": "SHA-256 hex digest of the artifact (64 lowercase hex chars).",
+                },
+                "storage_ref": {
+                    "type": "string",
+                    "description": "URI or path where the artifact is stored.",
+                },
+                "source_event_id": {
+                    "type": "string",
+                    "description": "event_id from ttm_ingress_post_event that this evidence is linked to.",
+                },
+                "verdict": {
+                    "type": "string",
+                    "enum": ["passed", "failed", "warning", "info"],
+                    "description": "Evidence verdict.",
+                },
+                "verification_status": {
+                    "type": "string",
+                    "description": "Verification status string, default 'passed'.",
+                },
+            },
+            "required": [
+                "run_id", "kind", "subject", "content_hash",
+                "storage_ref", "source_event_id", "verdict",
+            ],
+        },
+    },
+    handler=_handle_ttm_ingress_post_evidence,
+    check_fn=None,
+    is_async=False,
+    emoji="📎",
+    description="Attach a content-addressed evidence artifact to a TTM event.",
+)
+
+registry.register(
+    name="ttm_ingress_get_state",
+    toolset="ttm_ingress",
+    schema={
+        "name": "ttm_ingress_get_state",
+        "description": (
+            "Fetch the current run state snapshot from TTM. Returns the execution "
+            "contract (objective, scope, approval_policy), current scope_epoch, "
+            "run status, and approval gate entries. Use this to: (1) read the "
+            "initial contract at session start after ttm_ingress_bind, (2) poll "
+            "for operator approval decisions, (3) detect scope changes. "
+            "Auto-updates the bound scope_epoch for subsequent write calls."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "run_id": {"type": "string", "description": "TTM run UUID."},
+            },
+            "required": ["run_id"],
+        },
+    },
+    handler=_handle_ttm_ingress_get_state,
+    check_fn=None,
+    is_async=False,
+    emoji="📊",
+    description="Fetch the current TTM run state (contract, approvals, scope_epoch).",
+)
