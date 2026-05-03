@@ -541,11 +541,11 @@ async def _post_run_dispatched(binding: _RuntimeBinding) -> None:
 
     url = f"{base}/api/ingress/runtime/hermes/events"
     body = {
-        "event_type": "run.dispatched",
+        "event_type": "runtime.binding.confirmed",
         "actor_type": "runtime",
         "actor_id": "hermes",
         "expected_scope_epoch": 1,
-        "summary": "Hermes accepted the dispatch and bound the run",
+        "summary": "Hermes plugin bound the run and is spawning a headless agent session",
         "payload": {
             "runtime_run_ref": binding.runtime_run_ref,
             "runtime_binding_id": binding.runtime_binding_id,
@@ -725,11 +725,17 @@ async def _spawn_headless_session(binding: _RuntimeBinding, principal_token: str
 
     brief = (
         f"You are Hermes executing TTM run {binding.run_id}. "
-        f"Bind via tools.ttm_ingress.bind_run_from_env(), read run state, "
-        f"drive each gate in approval_policy: post events, attach evidence, "
-        f"request approval, poll for the operator decision, and emit "
-        f"run.closed when complete. The principal token is in "
-        f"TTM_PRINCIPAL_TOKEN; never log it."
+        f"Workflow: "
+        f"(1) Call ttm_ingress_bind (no args) to initialize the TTM connection from env. "
+        f"(2) Call ttm_ingress_get_state with run_id to read the execution contract and "
+        f"approval_policy. "
+        f"(3) For each gate in approval_policy: emit phase progress via ttm_ingress_post_event "
+        f"(event_type='phase.entered' when entering a phase, 'task.updated' for progress, "
+        f"'evidence.added' before attaching artifacts), attach artifacts via "
+        f"ttm_ingress_post_evidence, then open the gate via ttm_ingress_request_approval, "
+        f"and poll ttm_ingress_get_state until the operator grants or rejects it. "
+        f"(4) When all gates are complete emit run.closed via ttm_ingress_post_event. "
+        f"Never log the principal token (it is in TTM_PRINCIPAL_TOKEN env var only)."
     )
 
     try:
@@ -742,6 +748,8 @@ async def _spawn_headless_session(binding: _RuntimeBinding, principal_token: str
             "-Q",
             "--max-turns",
             "200",
+            "-t",
+            "ttm_ingress,terminal,file,web",
             env=env,
             stdin=asyncio.subprocess.DEVNULL,
             stdout=log_file,
