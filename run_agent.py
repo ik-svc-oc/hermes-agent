@@ -3765,6 +3765,24 @@ class AIAgent:
             metadata["tool_call_id"] = tool_call_id
         return {k: v for k, v in metadata.items() if v not in (None, "")}
 
+    @staticmethod
+    def _tool_result_succeeded(result: Any) -> bool:
+        """Return True only when a tool result explicitly did not fail."""
+        if isinstance(result, str):
+            try:
+                parsed = json.loads(result)
+            except Exception:
+                return False
+        elif isinstance(result, dict):
+            parsed = result
+        else:
+            return False
+        if not isinstance(parsed, dict):
+            return False
+        if parsed.get("success") is False or parsed.get("error"):
+            return False
+        return True
+
     def _apply_persist_user_message_override(self, messages: List[Dict]) -> None:
         """Rewrite the current-turn user message before persistence/return.
 
@@ -9515,9 +9533,18 @@ class AIAgent:
                 content=function_args.get("content"),
                 old_text=function_args.get("old_text"),
                 store=self._memory_store,
+                session_id=self.session_id or "",
+                scope=function_args.get("scope", ""),
+                source_reference=function_args.get("source_reference", ""),
+                project_id=function_args.get("project_id", ""),
+                approved_global=function_args.get("approved_global", False),
             )
-            # Bridge: notify external memory provider of built-in memory writes
-            if self._memory_manager and function_args.get("action") in ("add", "replace"):
+            # Bridge: notify external memory provider only after accepted built-in memory writes.
+            if (
+                self._memory_manager
+                and function_args.get("action") in ("add", "replace")
+                and self._tool_result_succeeded(result)
+            ):
                 try:
                     self._memory_manager.on_memory_write(
                         function_args.get("action", ""),
@@ -10122,9 +10149,18 @@ class AIAgent:
                     content=function_args.get("content"),
                     old_text=function_args.get("old_text"),
                     store=self._memory_store,
+                    session_id=self.session_id or "",
+                    scope=function_args.get("scope", ""),
+                    source_reference=function_args.get("source_reference", ""),
+                    project_id=function_args.get("project_id", ""),
+                    approved_global=function_args.get("approved_global", False),
                 )
-                # Bridge: notify external memory provider of built-in memory writes
-                if self._memory_manager and function_args.get("action") in ("add", "replace"):
+                # Bridge: notify external memory provider only after accepted built-in memory writes.
+                if (
+                    self._memory_manager
+                    and function_args.get("action") in ("add", "replace")
+                    and self._tool_result_succeeded(function_result)
+                ):
                     try:
                         self._memory_manager.on_memory_write(
                             function_args.get("action", ""),

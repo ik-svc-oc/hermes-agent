@@ -102,6 +102,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                args_hint="<prompt>"),
     CommandDef("goal", "Set a standing goal Hermes works on across turns until achieved", "Session",
                args_hint="[text | pause | resume | clear | status]"),
+    CommandDef("project", "Set or inspect the active project context for this session", "Session",
+               args_hint="[status | clear | set <id> <name> [capsule_path]]"),
     CommandDef("status", "Show session info", "Session"),
     CommandDef("profile", "Show active profile name and home directory", "Info"),
     CommandDef("sethome", "Set this chat as the home channel", "Session",

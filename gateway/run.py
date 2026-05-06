@@ -5087,6 +5087,15 @@ class GatewayRunner:
                     return await self._handle_goal_command(event)
                 return "Agent is running — use /goal status / pause / clear mid-run, or /stop before setting a new goal."
 
+            # /project is a session control-plane command.  Inspection and
+            # clearing are safe mid-run; setting/replacing project context waits
+            # until the current turn finishes to avoid racing durable-write gates.
+            if _cmd_def_inner and _cmd_def_inner.name == "project":
+                _project_arg = (event.get_command_args() or "").strip().lower()
+                if not _project_arg or _project_arg in ("status", "clear"):
+                    return await self._handle_project_command(event)
+                return "Agent is running — use /project status or /project clear mid-run, or /stop before setting a new project."
+
             # Session-level toggles that are safe to run mid-agent —
             # /yolo can unblock a pending approval prompt, /verbose cycles
             # the tool-progress display mode for the ongoing stream.
@@ -5432,6 +5441,9 @@ class GatewayRunner:
 
         if canonical == "goal":
             return await self._handle_goal_command(event)
+
+        if canonical == "project":
+            return await self._handle_project_command(event)
 
         if canonical == "voice":
             return await self._handle_voice_command(event)
@@ -8094,6 +8106,86 @@ class GatewayRunner:
         except Exception:
             max_turns = 20
         return GoalManager(session_id=sid, default_max_turns=max_turns), session_entry
+
+    async def _handle_project_command(self, event: "MessageEvent") -> str:
+        """Handle /project for gateway platforms.
+
+        Subcommands: ``/project`` / ``/project status`` / ``/project clear`` /
+        ``/project set <id> <name> [capsule_path]``.  The project context is
+        stored in SessionDB.state_meta and is loaded into the dynamic session
+        context on subsequent turns.
+        """
+        args = (event.get_command_args() or "").strip()
+        lower = args.lower()
+
+        try:
+            session_entry = self.session_store.get_or_create_session(event.source)
+            sid = getattr(session_entry, "session_id", "") or ""
+        except Exception as exc:
+            logger.debug("project command: session lookup failed: %s", exc)
+            sid = ""
+        if not sid:
+            return "Project context unavailable on this session."
+
+        try:
+            from hermes_cli.project_context import (
+                ActiveProjectContext,
+                clear_project_context,
+                load_project_context,
+                save_project_context,
+            )
+        except Exception as exc:
+            logger.debug("project command: project_context import failed: %s", exc)
+            return "Project context support is unavailable."
+
+        if not args or lower == "status":
+            ctx = load_project_context(sid)
+            if ctx is None:
+                return "No active project context set for this session."
+            lines = [
+                f"Active project: {ctx.project_id} — {ctx.project_name}",
+            ]
+            if ctx.capsule_path:
+                lines.append(f"Capsule: {ctx.capsule_path}")
+            if ctx.metadata:
+                safe = []
+                for key in sorted(ctx.metadata):
+                    value = ctx.metadata[key]
+                    if isinstance(value, (str, int, float, bool)) and str(value).strip():
+                        safe.append(f"{key}={value}")
+                if safe:
+                    lines.append(f"Metadata: {', '.join(safe[:8])}")
+            lines.append("Controls: /project clear · /project set <id> <name> [capsule_path]")
+            return "\n".join(lines)
+
+        if lower == "clear":
+            return "Project context cleared." if clear_project_context(sid) else "Project context clear failed."
+
+        if lower.startswith("set "):
+            import shlex
+            try:
+                parts = shlex.split(args)
+            except ValueError as exc:
+                return f"Invalid /project set syntax: {exc}"
+            if len(parts) < 3:
+                return "Usage: /project set <id> <name> [capsule_path]"
+            _, project_id, project_name, *rest = parts
+            capsule_path = rest[0] if rest else ""
+            ctx = ActiveProjectContext(
+                project_id=project_id,
+                project_name=project_name,
+                capsule_path=capsule_path,
+            )
+            err = save_project_context(sid, ctx)
+            if err:
+                return f"Project context not set: {err}"
+            return (
+                f"Project context set: {ctx.project_id} — {ctx.project_name}\n"
+                + (f"Capsule: {ctx.capsule_path}\n" if ctx.capsule_path else "")
+                + "Durable memory/skill writes now require explicit scope and source_reference."
+            )
+
+        return "Usage: /project [status | clear | set <id> <name> [capsule_path]]"
 
     async def _handle_goal_command(self, event: "MessageEvent") -> str:
         """Handle /goal for gateway platforms.
