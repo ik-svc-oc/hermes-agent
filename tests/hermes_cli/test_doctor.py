@@ -32,6 +32,44 @@ class TestDoctorPlatformHints:
         assert doctor._python_install_cmd() == "uv pip install"
         assert doctor._system_package_install_cmd("ripgrep") == "sudo apt install ripgrep"
 
+    def test_accepts_runtime_env_wrapper_symlink_target(self, tmp_path):
+        project = tmp_path / "hermes-agent"
+        venv_bin = project / "venv" / "bin" / "hermes"
+        venv_bin.parent.mkdir(parents=True)
+        venv_bin.write_text("#!/bin/sh\n", encoding="utf-8")
+        wrapper = tmp_path / "hermes-with-runtime-env.sh"
+        wrapper.write_text(
+            f"#!/usr/bin/env bash\nexec {project}/venv/bin/python -m hermes_cli.main \"$@\"\n",
+            encoding="utf-8",
+        )
+
+        assert doctor._is_acceptable_hermes_command_wrapper(wrapper, venv_bin)
+
+    def test_accepts_runtime_env_wrapper_with_hermes_home_placeholder(self, tmp_path):
+        project = tmp_path / "hermes-agent"
+        venv_bin = project / "venv" / "bin" / "hermes"
+        venv_bin.parent.mkdir(parents=True)
+        venv_bin.write_text("#!/bin/sh\n", encoding="utf-8")
+        wrapper = tmp_path / "hermes-with-runtime-env.sh"
+        wrapper.write_text(
+            "#!/usr/bin/env bash\n"
+            "export HERMES_HOME=\"${HERMES_HOME:-/Users/oc_runtime/.hermes}\"\n"
+            "exec \"$HERMES_HOME/hermes-agent/venv/bin/python\" -m hermes_cli.main \"$@\"\n",
+            encoding="utf-8",
+        )
+
+        assert doctor._is_acceptable_hermes_command_wrapper(wrapper, venv_bin)
+
+    def test_rejects_unrelated_command_wrapper_symlink_target(self, tmp_path):
+        project = tmp_path / "hermes-agent"
+        venv_bin = project / "venv" / "bin" / "hermes"
+        venv_bin.parent.mkdir(parents=True)
+        venv_bin.write_text("#!/bin/sh\n", encoding="utf-8")
+        wrapper = tmp_path / "other.sh"
+        wrapper.write_text("#!/usr/bin/env bash\nexec /tmp/other \"$@\"\n", encoding="utf-8")
+
+        assert not doctor._is_acceptable_hermes_command_wrapper(wrapper, venv_bin)
+
 
 class TestProviderEnvDetection:
     def test_detects_openai_api_key(self):
