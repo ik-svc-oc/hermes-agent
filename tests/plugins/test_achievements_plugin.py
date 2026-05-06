@@ -45,12 +45,19 @@ def plugin_api(tmp_path, monkeypatch):
     """
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
+    original_hermes_state = sys.modules.get("hermes_state")
     spec = importlib.util.spec_from_file_location(
         f"plugin_api_test_{id(tmp_path)}", PLUGIN_MODULE_PATH
     )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    yield module
+    try:
+        yield module
+    finally:
+        if original_hermes_state is None:
+            sys.modules.pop("hermes_state", None)
+        else:
+            sys.modules["hermes_state"] = original_hermes_state
 
 
 class _FakeSessionDB:
@@ -109,7 +116,7 @@ class _FakeSessionDB:
 def _install_fake_session_db(plugin_api, fake_db):
     """Inject a fake SessionDB so ``scan_sessions`` finds it via its local import."""
     fake_module = type(sys)("hermes_state")
-    fake_module.SessionDB = lambda: fake_db
+    fake_module.SessionDB = lambda *args, **kwargs: fake_db
     sys.modules["hermes_state"] = fake_module
 
 

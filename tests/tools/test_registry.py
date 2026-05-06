@@ -314,6 +314,7 @@ class TestBuiltinDiscovery:
             "tools.skills_tool",
             "tools.terminal_tool",
             "tools.todo_tool",
+            "tools.ttm_ingress",
             "tools.tts_tool",
             "tools.vision_tools",
             "tools.web_tools",
