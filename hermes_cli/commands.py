@@ -106,6 +106,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("goal", "Manage this session's persisted goal contract", "Session",
                args_hint="[status|new|lock|unlock|clear] [objective]",
                subcommands=("status", "new", "lock", "unlock", "clear")),
+    CommandDef("project", "Set or inspect the active project context for this session", "Session",
+               args_hint="[status | clear | set <id> <name> [capsule_path]]"),
     CommandDef("profile", "Show active profile name and home directory", "Info"),
     CommandDef("sethome", "Set this chat as the home channel", "Session",
                gateway_only=True, aliases=("set-home",)),
