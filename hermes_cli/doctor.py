@@ -78,6 +78,35 @@ def _system_package_install_cmd(pkg: str) -> str:
     return f"sudo apt install {pkg}"
 
 
+def _is_acceptable_hermes_command_wrapper(target: Path, expected_venv_bin: Path) -> bool:
+    """Return true when ~/.local/bin/hermes points to a safe Hermes wrapper.
+
+    Some deployments intentionally route the command through a small shell
+    wrapper that loads runtime env before executing ``python -m hermes_cli.main``.
+    Doctor should not flag those wrappers as broken merely because the symlink
+    target is not the venv-generated console script.
+    """
+    try:
+        if not target.is_file():
+            return False
+        text = target.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return False
+
+    expected_root = expected_venv_bin.resolve().parents[2]
+    wrapper_mentions_project = (
+        str(expected_root) in text
+        or "$HERMES_HOME/hermes-agent" in text
+        or "${HERMES_HOME}/hermes-agent" in text
+        or "${HERMES_HOME:-" in text and "/.hermes}/hermes-agent" in text
+    )
+    return (
+        "hermes_cli.main" in text
+        and "exec" in text
+        and wrapper_mentions_project
+    )
+
+
 def _safe_which(cmd: str) -> str | None:
     """shutil.which wrapper resilient to platform monkeypatching in tests."""
     try:
@@ -834,6 +863,8 @@ def run_doctor(args):
                 _expected = _venv_bin.resolve()
                 if _target == _expected:
                     check_ok(f"{_cmd_link_display}/hermes → correct target")
+                elif _is_acceptable_hermes_command_wrapper(_target, _venv_bin):
+                    check_ok(f"{_cmd_link_display}/hermes → accepted runtime-env wrapper")
                 else:
                     check_warn(
                         f"{_cmd_link_display}/hermes points to wrong target",
