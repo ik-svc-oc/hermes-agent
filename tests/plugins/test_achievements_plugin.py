@@ -45,6 +45,7 @@ def plugin_api(tmp_path, monkeypatch):
     """
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
+    original_hermes_state = sys.modules.get("hermes_state")
     spec = importlib.util.spec_from_file_location(
         f"plugin_api_test_{id(tmp_path)}", PLUGIN_MODULE_PATH
     )
@@ -56,7 +57,13 @@ def plugin_api(tmp_path, monkeypatch):
     # fake into later tests in the same xdist worker — breaking every
     # test that does ``from hermes_state import SessionDB``.
     module._test_monkeypatch = monkeypatch
-    yield module
+    try:
+        yield module
+    finally:
+        if original_hermes_state is None:
+            sys.modules.pop("hermes_state", None)
+        else:
+            sys.modules["hermes_state"] = original_hermes_state
 
 
 class _FakeSessionDB:
@@ -120,7 +127,7 @@ def _install_fake_session_db(plugin_api, fake_db):
     and cannot leak into unrelated tests in the same xdist worker.
     """
     fake_module = type(sys)("hermes_state")
-    fake_module.SessionDB = lambda: fake_db
+    fake_module.SessionDB = lambda *args, **kwargs: fake_db
     plugin_api._test_monkeypatch.setitem(sys.modules, "hermes_state", fake_module)
 
 

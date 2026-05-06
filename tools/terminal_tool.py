@@ -1098,6 +1098,48 @@ def _get_modal_backend_state(modal_mode: object | None) -> Dict[str, Any]:
     )
 
 
+def get_terminal_backend_status(*, log_failures: bool = True) -> Dict[str, Any]:
+    """Return a lightweight health summary for the configured terminal backend.
+
+    This is intentionally side-effect-free: it validates static configuration and
+    import-time requirements without creating containers, SSH sessions, or cloud
+    sandboxes. Agent startup uses it only to decide whether terminal-backed
+    toolsets appear publishable enough to warn about publication mismatches.
+    """
+    try:
+        config = _get_env_config()
+    except Exception as exc:
+        reason = str(exc)
+        if log_failures:
+            logger.warning("Terminal backend configuration is invalid: %s", reason)
+        return {"healthy": False, "env_type": os.getenv("TERMINAL_ENV", "local"), "reason": reason}
+
+    env_type = config.get("env_type", "local")
+    reason = ""
+    healthy = True
+
+    if env_type == "ssh" and not config.get("ssh_host"):
+        healthy = False
+        reason = "TERMINAL_ENV=ssh requires TERMINAL_SSH_HOST"
+    elif env_type == "modal":
+        state = _get_modal_backend_state(config.get("modal_mode"))
+        healthy = bool(state.get("selected_backend"))
+        if not healthy:
+            reason = "Modal backend selected but no direct or managed backend is available"
+    elif env_type == "vercel_sandbox":
+        healthy = _check_vercel_sandbox_requirements(config)
+        if not healthy:
+            reason = "Vercel Sandbox backend requirements are not satisfied"
+    elif env_type not in {"local", "docker", "singularity", "daytona"}:
+        healthy = False
+        reason = f"Unsupported TERMINAL_ENV={env_type!r}"
+
+    if not healthy and log_failures:
+        logger.warning("Terminal backend %s is not healthy: %s", env_type, reason)
+
+    return {"healthy": healthy, "env_type": env_type, "reason": reason}
+
+
 def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
                         ssh_config: dict = None, container_config: dict = None,
                         local_config: dict = None,
