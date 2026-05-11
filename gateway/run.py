@@ -2988,8 +2988,22 @@ class GatewayRunner:
                 exc_info=True,
             )
 
-        # Discover and load event hooks
+        # Discover and load event hooks (gateway.hooks / HOOK.yaml system)
         self.hooks.discover_and_load()
+
+        # Bootstrap the hermes_cli PluginManager so pre_gateway_dispatch and
+        # other lifecycle hooks registered via plugin.yaml (e.g.
+        # telegram-admin-fastpath) are active from the first message.
+        # Without this call the singleton is created lazily with _discovered=False
+        # and invoke_hook() returns [] — user plugins silently never fire.
+        try:
+            from hermes_cli.plugins import discover_plugins as _discover_plugins
+            _discover_plugins()
+        except Exception:
+            logger.debug(
+                "hermes_cli plugin discovery failed at gateway startup",
+                exc_info=True,
+            )
 
         
         # Recover background processes from checkpoint (crash recovery)
