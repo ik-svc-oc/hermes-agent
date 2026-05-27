@@ -90,6 +90,21 @@ async def test_gateway_stop_interrupts_running_agents_and_cancels_adapter_tasks(
 
 
 @pytest.mark.asyncio
+async def test_runtime_status_heartbeat_refreshes_idle_gateway_status():
+    runner, _adapter = make_restart_runner()
+
+    task = asyncio.create_task(
+        runner._runtime_status_heartbeat_loop(interval=0.01)
+    )
+    await asyncio.sleep(0.03)
+    runner._running = False
+    await task
+
+    assert runner._update_runtime_status.call_count >= 1
+    runner._update_runtime_status.assert_any_call("running")
+
+
+@pytest.mark.asyncio
 async def test_gateway_stop_drains_running_agents_before_disconnect():
     runner, adapter = make_restart_runner()
     disconnect_mock = AsyncMock()

@@ -1861,6 +1861,30 @@ class GatewayRunner:
         self._background_tasks: set = set()
 
 
+    def _track_background_task(self, task: asyncio.Task) -> None:
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    async def _runtime_status_heartbeat_loop(self, interval: float = 60.0) -> None:
+        """Keep gateway_state.json fresh while the gateway is healthy but idle."""
+        while self._running:
+            await asyncio.sleep(interval)
+            if not self._running:
+                break
+            try:
+                self._update_runtime_status("running")
+            except Exception as exc:
+                logger.debug("Runtime status heartbeat failed: %s", exc)
+
+    def _start_runtime_status_heartbeat(self) -> None:
+        self._track_background_task(
+            asyncio.create_task(
+                self._runtime_status_heartbeat_loop(),
+                name="gateway-runtime-status-heartbeat",
+            )
+        )
+
+
     def _wire_teams_pipeline_runtime(self) -> None:
         """Bind the Teams meeting pipeline runtime to Graph webhook ingress.
 
@@ -4355,6 +4379,12 @@ class GatewayRunner:
 
         # Start background session expiry watcher to finalize expired sessions
         asyncio.create_task(self._session_expiry_watcher())
+
+        # Keep persisted runtime health fresh during quiet periods. Without
+        # this, gateway_state.json only changes on startup, platform events,
+        # active-agent changes, and shutdown, so external health checks can
+        # mistake a long-idle but live gateway for a stale one.
+        self._start_runtime_status_heartbeat()
 
         # Start background kanban notifier — delivers `completed`, `blocked`,
         # `spawn_auto_blocked`, and `crashed` events to gateway subscribers
