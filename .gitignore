@@ -82,3 +82,7 @@ models-dev-upstream/
 hermes_cli/tui_dist/*
 hermes_cli/scripts/
 docs/superpowers/*
+
+# Local runtime evidence and external checkout artifacts.
+.evidence/
+tinker-atropos/
