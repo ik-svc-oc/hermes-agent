@@ -1,8 +1,15 @@
 """Tests for hermes -z --usage-file (per-run JSON usage report)."""
 
 import json
+import logging
+from unittest.mock import MagicMock
 
-from hermes_cli.oneshot import _write_usage_file
+from hermes_cli.oneshot import (
+    _mark_oneshot_session_end,
+    _oneshot_end_reason,
+    _write_usage_file,
+    run_oneshot,
+)
 
 
 def _result(**overrides):
@@ -67,3 +74,43 @@ class TestWriteUsageFile:
         path = tmp_path / "usage.json"
         _write_usage_file(str(path), _result(failed=True))
         assert json.loads(path.read_text())["failed"] is True
+
+
+class TestOneshotSessionEnd:
+    def test_end_reason_classification(self):
+        assert _oneshot_end_reason("ok", _result()) == "oneshot_complete"
+        assert _oneshot_end_reason("ok", _result(failed=True)) == "oneshot_error"
+        assert _oneshot_end_reason("", _result()) == "oneshot_error"
+        assert _oneshot_end_reason("ok", _result(interrupted=True)) == "oneshot_interrupted"
+
+    def test_mark_oneshot_session_end_is_best_effort(self):
+        db = MagicMock()
+        _mark_oneshot_session_end(db, "sess-1", "oneshot_complete")
+        db.end_session.assert_called_once_with("sess-1", "oneshot_complete")
+
+        # Missing db/session/reason are no-ops, not crashes.
+        _mark_oneshot_session_end(None, "sess-1", "oneshot_complete")
+        _mark_oneshot_session_end(db, None, "oneshot_complete")
+        _mark_oneshot_session_end(db, "sess-1", "")
+
+    def test_run_oneshot_marks_session_complete(self, monkeypatch, capsys):
+        db = MagicMock()
+        monkeypatch.setattr(
+            "hermes_cli.oneshot._create_session_db_for_oneshot",
+            lambda: db,
+        )
+        monkeypatch.setattr(
+            "hermes_cli.oneshot._run_agent",
+            lambda *args, **kwargs: (
+                "ROUTE-OK",
+                _result(session_id="sess-oneshot", failed=False, partial=False),
+            ),
+        )
+
+        try:
+            assert run_oneshot("probe") == 0
+        finally:
+            logging.disable(logging.NOTSET)
+
+        assert capsys.readouterr().out == "ROUTE-OK\n"
+        db.end_session.assert_called_once_with("sess-oneshot", "oneshot_complete")

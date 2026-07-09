@@ -160,6 +160,31 @@ def _write_usage_file(path: Optional[str], result: dict, failure: Optional[str] 
         pass
 
 
+def _oneshot_end_reason(response: Optional[str], result: dict) -> str:
+    """Return the durable session end reason for a completed ``-z`` turn."""
+    if result.get("interrupted"):
+        return "oneshot_interrupted"
+    if result.get("failed") or result.get("partial"):
+        return "oneshot_error"
+    if not (response or "").strip():
+        return "oneshot_error"
+    return "oneshot_complete"
+
+
+def _mark_oneshot_session_end(
+    session_db,
+    session_id: Optional[str],
+    reason: str,
+) -> None:
+    """Best-effort durable close marker for top-level ``hermes -z`` sessions."""
+    if not session_db or not session_id or not reason:
+        return
+    try:
+        session_db.end_session(session_id, reason)
+    except Exception:
+        pass
+
+
 def run_oneshot(
     prompt: str,
     model: Optional[str] = None,
@@ -259,6 +284,11 @@ def run_oneshot(
         real_stderr.flush()
         return 1
 
+    _mark_oneshot_session_end(
+        _create_session_db_for_oneshot(),
+        result.get("session_id"),
+        _oneshot_end_reason(response, result),
+    )
     _write_usage_file(usage_file, result)
 
     if response:
@@ -416,7 +446,21 @@ def _run_agent(
     agent.stream_delta_callback = None
     agent.tool_gen_callback = None
 
-    result = agent.run_conversation(prompt)
+    try:
+        result = agent.run_conversation(prompt)
+        if isinstance(result, dict):
+            result.setdefault("session_id", getattr(agent, "session_id", None))
+            result.setdefault("model", getattr(agent, "model", None))
+            result.setdefault("provider", getattr(agent, "provider", None))
+    except BaseException as exc:
+        _mark_oneshot_session_end(
+            session_db,
+            getattr(agent, "session_id", None),
+            "oneshot_interrupted"
+            if isinstance(exc, KeyboardInterrupt)
+            else "oneshot_error",
+        )
+        raise
     return (result.get("final_response") or "", result)
 
 

@@ -1225,9 +1225,26 @@ def _notify_single_query_session_finalize(cli, *, reason: str = "shutdown") -> N
         _single_query_finalize_attempted_session_ids.add(session_id)
 
 
+def _mark_single_query_session_end(cli) -> None:
+    """Persist the terminal reason for a one-shot CLI session."""
+    reason = getattr(cli, "_single_query_end_reason", None)
+    if not reason:
+        return
+    agent = getattr(cli, "agent", None)
+    session_id = getattr(agent, "session_id", None) or getattr(cli, "session_id", None)
+    session_db = getattr(cli, "_session_db", None)
+    if not session_db or not session_id:
+        return
+    try:
+        session_db.end_session(session_id, reason)
+    except Exception:
+        pass
+
+
 def _finalize_single_query(cli) -> None:
     """Close one-shot CLI resources before releasing the active session lease."""
     try:
+        _mark_single_query_session_end(cli)
         _notify_single_query_session_finalize(cli)
         _run_cleanup(notify_session_finalize=False)
     finally:
@@ -12093,6 +12110,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         # this to True. Early returns (credential refresh failure, etc.)
         # leave it False, which is correct — those aren't user interrupts.
         self._last_turn_interrupted = False
+        self._last_turn_failed = False
 
         # Refresh provider credentials if needed (handles key rotation transparently)
         if not self._ensure_runtime_credentials():
@@ -12585,6 +12603,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             # Handle interrupt - check if we were interrupted
             pending_message = None
             _interrupted_this_turn = bool(result and result.get("interrupted"))
+            self._last_turn_failed = bool(
+                result and (result.get("failed") or result.get("partial"))
+            )
             # Expose the flag for post-turn hooks (e.g. goal continuation)
             # so they can skip themselves when the turn was user-cancelled.
             self._last_turn_interrupted = _interrupted_this_turn
@@ -15914,6 +15935,7 @@ def main(
         pass_session_id=pass_session_id,
         ignore_rules=ignore_rules,
     )
+    setattr(cli, "_single_query_end_reason", None)
 
     if parsed_skills:
         skills_prompt, loaded_skills, missing_skills = build_preloaded_skills_prompt(
@@ -16164,6 +16186,7 @@ def main(
                                 conversation_history=cli.conversation_history,
                             )
                         except KeyboardInterrupt:
+                            setattr(cli, "_single_query_end_reason", "oneshot_interrupted")
                             _emit_interrupted_session_end(cli, reason="keyboard_interrupt")
                             print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
                             sys.exit(130)
@@ -16190,6 +16213,15 @@ def main(
                             print(f"Error: {result['error']}", file=sys.stderr)
                         elif response:
                             print(response)
+
+                        setattr(
+                            cli,
+                            "_single_query_end_reason",
+                            "oneshot_error"
+                            if isinstance(result, dict)
+                            and (result.get("failed") or result.get("partial"))
+                            else "oneshot_complete",
+                        )
 
                         # Kanban goal-loop mode: a worker spawned for a
                         # goal_mode card keeps working in THIS session until an
@@ -16235,6 +16267,7 @@ def main(
                         sys.exit(_exit_code)
 
                 # Exit with error code if credentials or agent init fails
+                setattr(cli, "_single_query_end_reason", "oneshot_error")
                 sys.exit(1)
             else:
                 # Single-query mode (`hermes chat -q "…"`): skip the welcome
@@ -16256,7 +16289,14 @@ def main(
                 # Surface security advisories before the agent runs — short
                 # banner, doesn't depend on the welcome banner being shown.
                 cli._show_security_advisories()
-                cli.chat(query, images=single_query_images or None)
+                _single_response = cli.chat(query, images=single_query_images or [])
+                setattr(
+                    cli,
+                    "_single_query_end_reason",
+                    "oneshot_error"
+                    if _single_response is None or getattr(cli, "_last_turn_failed", False)
+                    else "oneshot_complete",
+                )
                 cli._print_exit_summary(clear_screen=False)
         finally:
             _finalize_single_query(cli)

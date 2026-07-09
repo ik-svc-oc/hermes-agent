@@ -111,6 +111,26 @@ def test_cleanup_provider_exception_is_swallowed(mock_invoke_hook):
     agent.shutdown_memory_provider.assert_called_once()
 
 
+def test_finalize_single_query_marks_oneshot_complete_before_releasing_session():
+    """One-shot CLI shutdown must stamp a durable completion reason."""
+    import cli as cli_mod
+
+    db = MagicMock()
+    cli = MagicMock()
+    cli._session_db = db
+    cli.session_id = "oneshot-session"
+    cli.agent = None
+    cli._single_query_end_reason = "oneshot_complete"
+
+    with patch.object(cli_mod, "_notify_single_query_session_finalize"), patch.object(
+        cli_mod, "_run_cleanup"
+    ):
+        cli_mod._finalize_single_query(cli)
+
+    db.end_session.assert_called_once_with("oneshot-session", "oneshot_complete")
+    cli._release_active_session.assert_called_once()
+
+
 def test_cli_close_persists_agent_session_messages_before_end_session():
     """CLI shutdown flushes live agent messages before closing the session."""
     import cli as cli_mod
