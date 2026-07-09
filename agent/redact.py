@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import shlex
+import threading
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +89,7 @@ _PREFIX_PATTERNS = [
     r"sk_live_[A-Za-z0-9]{10,}",        # Stripe secret key (live)
     r"sk_test_[A-Za-z0-9]{10,}",        # Stripe secret key (test)
     r"rk_live_[A-Za-z0-9]{10,}",        # Stripe restricted key
-    r"SG\.[A-Za-z0-9_-]{10,}",          # SendGrid API key
+    r"SG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}",  # SendGrid API key (both dot-segments)
     r"hf_[A-Za-z0-9]{10,}",             # HuggingFace token
     r"r8_[A-Za-z0-9]{10,}",             # Replicate API token
     r"npm_[A-Za-z0-9]{10,}",            # npm access token
@@ -107,6 +108,9 @@ _PREFIX_PATTERNS = [
     r"brv_[A-Za-z0-9]{10,}",            # ByteRover API key
     r"xai-[A-Za-z0-9]{30,}",            # xAI (Grok) API key
     r"ntn_[A-Za-z0-9]{10,}",            # Notion internal integration token
+    r"glsa_[A-Za-z0-9_-]{10,}",         # Grafana service-account token (base64url)
+    r"phx_[A-Za-z0-9_-]{10,}",          # PostHog personal API key (base64url)
+    r"phc_[A-Za-z0-9_-]{10,}",          # PostHog project API key (base64url)
     r"fw-[A-Za-z0-9]{30,}",             # Fireworks AI API key
     r"fw_[A-Za-z0-9]{30,}",             # Fireworks AI API key
     r"fpk_[A-Za-z0-9]{30,}",            # Fireworks AI project key
@@ -211,9 +215,11 @@ _SECRET_HEADER_RE = re.compile(
 )
 
 # Telegram bot tokens: bot<digits>:<token> or <digits>:<token>,
-# where token part is restricted to [-A-Za-z0-9_] and length >= 30
+# where token part is restricted to [-A-Za-z0-9_] and length >= 30.
+# Digit prefix floor is 6 (real bot IDs are 8-10 digits, but the 30-char
+# token requirement keeps false positives negligible even at 6).
 _TELEGRAM_RE = re.compile(
-    r"(bot)?(\d{8,}):([-A-Za-z0-9_]{30,})",
+    r"(bot)?(\d{6,}):([-A-Za-z0-9_]{30,})",
 )
 
 # Private key blocks: -----BEGIN RSA PRIVATE KEY----- ... -----END RSA PRIVATE KEY-----
@@ -593,9 +599,11 @@ def redact_sensitive_text(
             text = _YAML_ASSIGN_RE.sub(_redact_yaml, text)
 
     # Authorization headers — _AUTH_HEADER_RE matches any scheme after
-    # "[Proxy-]Authorization:" case-insensitively, so "uthorization" is the
-    # cheapest substring gate that covers every casing without a casefold().
-    if "uthorization" in text or "UTHORIZATION" in text:
+    # "[Proxy-]Authorization:" case-insensitively. The pre-gate must be
+    # case-insensitive too, or a mixed-case "AuThOrIzAtIoN:" header slips past
+    # the substring check and the regex never runs. One casefold on the
+    # (already-small) log line is cheap insurance against that miss.
+    if "uthorization" in text.lower():
         text = _AUTH_HEADER_RE.sub(
             lambda m: m.group(1) + (m.group(2) or "") + _mask_token(m.group(3)),
             text,
@@ -809,3 +817,307 @@ class RedactingFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         original = super().format(record)
         return redact_sensitive_text(original)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Runtime env-VALUE denylist
+#
+# Shape-based patterns above only catch secrets whose format is known. Opaque
+# secrets — a random-looking OAuth token, a bespoke API key with no vendor
+# prefix — slip through. To close that gap for data at rest, we build a denylist
+# of the *actual* secret values loaded from the operator's env files and mask
+# any exact occurrence, regardless of shape.
+#
+# The denylist reads the two canonical env files directly rather than
+# os.environ so the match set is the operator's declared secrets, not every
+# inherited environment variable (PATH, HOME, …). It ALSO filters by
+# secret-like KEY NAME (B2): a bare ``MODEL=…`` / ``PROJECT_ID=…`` /
+# ``CORS_ORIGINS=…`` line has a long value but is not a secret, and masking its
+# value corrupts ordinary transcript text. Only values whose key looks like a
+# credential (KEY/TOKEN/SECRET/PASSWORD/CREDENTIAL/AUTH/…) enter the denylist.
+#
+# The compiled alternation is cached and rebuilt only when an env file's mtime
+# or size changes (S1), so rotating a credential is picked up without a restart
+# while steady-state persists stay a cheap two-``stat`` check.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Files scanned for secret VALUES. Order is irrelevant — values are deduped.
+_ENV_DENYLIST_FILES = ("~/.env", "~/.hermes/.env")
+
+# Values shorter than this are ignored: too likely to be a common word or a
+# non-secret flag ("true", "1", "prod") and too likely to false-positive on
+# ordinary text.
+_ENV_DENYLIST_MIN_LEN = 8
+
+# Underscore/hyphen-delimited key segments that mark a line's VALUE as a secret.
+# Matched against SCREAMING_SNAKE key segments so "MONKEY" (segment "MONKEY")
+# does NOT match "KEY", while "FAL_KEY" / "GITHUB_TOKEN" / "VAULT_PASSWORD" do.
+_DENYLIST_SECRET_KEY_SEGMENTS = frozenset({
+    "KEY", "KEYS", "APIKEY", "TOKEN", "TOKENS", "SECRET", "SECRETS",
+    "PASSWORD", "PASSWD", "PASS", "CREDENTIAL", "CREDENTIALS", "CRED",
+    "AUTH", "PAT", "PRIVATEKEY", "ACCESSKEY", "SIGNINGKEY", "BEARER",
+    "SESSION", "COOKIE", "DSN",
+})
+
+# Placeholder substituted when a redactor faults on a persistence / search
+# boundary. Callers fail CLOSED to this rather than emitting the raw value.
+REDACTION_ERROR_PLACEHOLDER = "[REDACTION-ERROR]"
+
+_denylist_lock = threading.Lock()
+_denylist_re = None        # compiled alternation, or None if no values
+_denylist_signature = None  # (path, mtime_ns, size) tuple the cache was built from
+
+
+def _is_secret_key_name(key: str) -> bool:
+    """True if an env KEY name looks like it holds a credential (B2 filter)."""
+    up = key.upper()
+    if "API_KEY" in up or "APIKEY" in up:
+        return True
+    return any(seg in _DENYLIST_SECRET_KEY_SEGMENTS for seg in re.split(r"[_\-]", up))
+
+
+def _parse_env_file_secrets(path: str) -> "list[str]":
+    """Extract secret VALUES (secret-like key only) from a dotenv file.
+
+    Never raises. Strips ``export``, one layer of matching quotes, and a
+    dotenv-style inline ``# comment`` on unquoted values (S2).
+    """
+    values: "list[str]" = []
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for raw_line in fh:
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("export "):
+                    line = line[len("export "):].lstrip()
+                if "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                key = key.strip()
+                value = value.strip()
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+                    # Quoted: strip quotes; the quotes already delimit any '#'.
+                    value = value[1:-1]
+                else:
+                    # Unquoted: a run of whitespace followed by '#' starts an
+                    # inline comment (`TOKEN=abc  # note` → `abc`).
+                    value = re.sub(r"\s+#.*$", "", value).strip()
+                if len(value) < _ENV_DENYLIST_MIN_LEN:
+                    continue
+                if not _is_secret_key_name(key):
+                    continue
+                values.append(value)
+    except OSError:
+        pass
+    return values
+
+
+def _env_files_signature():
+    """(path, mtime_ns, size) per env file — cheap change detector for S1."""
+    sig = []
+    for rel in _ENV_DENYLIST_FILES:
+        p = os.path.expanduser(rel)
+        try:
+            st = os.stat(p)
+            sig.append((p, st.st_mtime_ns, st.st_size))
+        except OSError:
+            sig.append((p, None, None))
+    return tuple(sig)
+
+
+def _build_denylist_regex():
+    """Compile a single alternation of every env secret value. None if empty."""
+    seen = set()
+    for rel in _ENV_DENYLIST_FILES:
+        for value in _parse_env_file_secrets(os.path.expanduser(rel)):
+            seen.add(value)
+    if not seen:
+        return None
+    # Longest-first so an overlapping/prefix secret masks in full rather than
+    # leaving a tail behind.
+    ordered = sorted(seen, key=len, reverse=True)
+    return re.compile("|".join(re.escape(v) for v in ordered))
+
+
+def _get_denylist_regex():
+    """Return the cached denylist regex, rebuilding it when env files change."""
+    global _denylist_re, _denylist_signature
+    current = _env_files_signature()
+    if _denylist_signature == current:
+        return _denylist_re
+    with _denylist_lock:
+        current = _env_files_signature()
+        if _denylist_signature != current:
+            try:
+                _denylist_re = _build_denylist_regex()
+            except Exception:
+                # Never let denylist construction break a persist/read path.
+                _denylist_re = None
+            _denylist_signature = current
+    return _denylist_re
+
+
+def reset_denylist_cache() -> None:
+    """Force a rebuild of the denylist on the next call.
+
+    The denylist normally rebuilds itself when an env file's mtime/size changes;
+    this hard-resets the cache (used by tests that seed env files after import,
+    or to force an immediate rebuild after a same-second credential rotation
+    that leaves mtime unchanged).
+    """
+    global _denylist_re, _denylist_signature
+    with _denylist_lock:
+        _denylist_re = None
+        _denylist_signature = None
+
+
+def _redact_env_value_denylist(text: str) -> str:
+    """Mask any exact occurrence of a known env secret value."""
+    regex = _get_denylist_regex()
+    if regex is None:
+        return text
+    return regex.sub(lambda m: _mask_token(m.group(0)), text)
+
+
+def redact_for_storage(text, *, force: bool = False):
+    """Redaction for data at rest and for read/recall result paths.
+
+    Runs the env-value denylist FIRST (S4) so an opaque secret is masked by its
+    exact value while the full value is still intact — a later shape pattern
+    can no longer mutate part of it and leave the tail exposed — then applies
+    every shape-based pattern via :func:`redact_sensitive_text`.
+
+    Honours the global ``HERMES_REDACT_SECRETS`` switch; pass ``force=True`` for
+    persistence / search boundaries that must never emit raw secrets regardless
+    of that display-only preference. Non-string input is returned unchanged.
+    """
+    if text is None:
+        return None
+    if not isinstance(text, str):
+        return text
+    if not text:
+        return text
+    if not (force or _REDACT_ENABLED):
+        return text
+    text = _redact_env_value_denylist(text)
+    text = redact_sensitive_text(text, force=force)
+    return text
+
+
+def redact_message_content(content, *, force: bool = False):
+    """Redact secrets from a message ``content`` value before it is persisted.
+
+    Handles both plain-string content and the multimodal list-of-parts shape
+    (``[{"type": "text", "text": ...}, {"type": "image_url", ...}]`` /
+    ``{"type": "input_text", "content": ...}``). Image / binary parts are left
+    untouched; only text fields pass through :func:`redact_for_storage`.
+    Returns a new object — the caller's input is not mutated in place.
+    """
+    if content is None:
+        return None
+    if isinstance(content, str):
+        return redact_for_storage(content, force=force)
+    if isinstance(content, list):
+        redacted = []
+        for part in content:
+            if isinstance(part, dict):
+                part = dict(part)
+                if isinstance(part.get("text"), str):
+                    part["text"] = redact_for_storage(part["text"], force=force)
+                if isinstance(part.get("content"), str):
+                    part["content"] = redact_for_storage(part["content"], force=force)
+            redacted.append(part)
+        return redacted
+    return content
+
+
+def redact_structured_for_storage(obj, *, force: bool = True):
+    """Recursively scrub every string leaf of a JSON-ish structure.
+
+    Used for serialized message payloads (``reasoning_details``,
+    ``codex_reasoning_items``, ``codex_message_items``): parse → scrub strings →
+    re-serialize, preserving structure. Because it walks the *parsed* object,
+    secrets that would be JSON-escaped in the raw string (embedded quotes /
+    newlines) are still caught. ``force=True`` by default — this is a storage
+    boundary.
+    """
+    if isinstance(obj, str):
+        return redact_for_storage(obj, force=force)
+    if isinstance(obj, dict):
+        return {k: redact_structured_for_storage(v, force=force) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [redact_structured_for_storage(v, force=force) for v in obj]
+    return obj
+
+
+# ── Fail-CLOSED storage boundary API (B3 force + B4 fail-closed) ─────────────
+#
+# These are the entry points persistence and search callers use. They always
+# force redaction (the display-only opt-out must not weaken data at rest) and,
+# on any redactor fault, return a placeholder instead of the raw value.
+
+def scrub_text_for_storage(value):
+    """Fail-closed scrub of a plain-text field. None passes through."""
+    if value is None:
+        return None
+    try:
+        return redact_for_storage(value, force=True)
+    except Exception:
+        logger.exception("scrub_text_for_storage failed; failing closed")
+        return REDACTION_ERROR_PLACEHOLDER
+
+
+def scrub_content_for_storage(content):
+    """Fail-closed scrub of a message ``content`` (str or list-of-parts)."""
+    if content is None:
+        return None
+    try:
+        return redact_message_content(content, force=True)
+    except Exception:
+        logger.exception("scrub_content_for_storage failed; failing closed")
+        return REDACTION_ERROR_PLACEHOLDER
+
+
+def scrub_structured_for_storage(obj):
+    """Fail-closed recursive scrub of a JSON-ish payload."""
+    if obj is None:
+        return None
+    try:
+        return redact_structured_for_storage(obj, force=True)
+    except Exception:
+        logger.exception("scrub_structured_for_storage failed; failing closed")
+        return REDACTION_ERROR_PLACEHOLDER
+
+
+# Message record field → scrubber. One recursive record-level scrubber (B1),
+# shared by the state.db write path AND the session-JSON snapshot writer so the
+# two can never drift on which fields get cleaned.
+_STORAGE_TEXT_FIELDS = ("reasoning", "reasoning_content")
+_STORAGE_CONTENT_FIELDS = ("content",)
+_STORAGE_STRUCTURED_FIELDS = (
+    "reasoning_details",
+    "codex_reasoning_items",
+    "codex_message_items",
+)
+
+
+def scrub_record_for_storage(record):
+    """Return a copy of a message-like dict with every secret-bearing field
+    scrubbed (content, reasoning, reasoning_content, and the serialized
+    reasoning/codex payloads). Fails closed per-field. Keys absent from the
+    record are left absent; ``None`` values pass through untouched.
+    """
+    if not isinstance(record, dict):
+        return record
+    out = dict(record)
+    for field in _STORAGE_CONTENT_FIELDS:
+        if out.get(field) is not None:
+            out[field] = scrub_content_for_storage(out[field])
+    for field in _STORAGE_TEXT_FIELDS:
+        if out.get(field) is not None:
+            out[field] = scrub_text_for_storage(out[field])
+    for field in _STORAGE_STRUCTURED_FIELDS:
+        if out.get(field) is not None:
+            out[field] = scrub_structured_for_storage(out[field])
+    return out

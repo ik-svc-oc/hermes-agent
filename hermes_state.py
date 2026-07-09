@@ -17,6 +17,7 @@ Key design decisions:
 import asyncio
 import json
 import logging
+import os
 import random
 import re
 import sqlite3
@@ -123,6 +124,62 @@ T = TypeVar("T")
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
 SCHEMA_VERSION = 19
+
+
+def _redact_persisted_text(value):
+    """Fail-CLOSED scrub of a plain-text field bound for persistence / search.
+
+    Forces redaction (the display-only ``HERMES_REDACT_SECRETS`` opt-out must
+    not weaken data at rest) and, on any redactor fault, yields a placeholder
+    rather than the raw value.
+    """
+    if value is None:
+        return None
+    try:
+        from agent.redact import scrub_text_for_storage
+        return scrub_text_for_storage(value)
+    except Exception:
+        logger.exception("persisted-text redaction unavailable; failing closed")
+        return "[REDACTION-ERROR]"
+
+
+def _scrub_record_for_storage(record: Dict[str, Any]) -> Dict[str, Any]:
+    """Fail-CLOSED scrub of a message record (content + reasoning + serialized
+    reasoning/codex payloads) via the shared record scrubber."""
+    try:
+        from agent.redact import scrub_record_for_storage
+        return scrub_record_for_storage(record)
+    except Exception:
+        logger.exception("record redaction unavailable; failing closed")
+        # Fail closed: blank every secret-bearing field rather than persist raw.
+        safe = dict(record)
+        for field in (
+            "content", "reasoning", "reasoning_content",
+            "reasoning_details", "codex_reasoning_items", "codex_message_items",
+        ):
+            if safe.get(field) is not None:
+                safe[field] = "[REDACTION-ERROR]"
+        return safe
+
+
+def _ensure_db_file_perms(db_path: "Path") -> None:
+    """Best-effort chmod 0600 on a SQLite DB file and its WAL/SHM sidecars.
+
+    state.db (and the machine-ledger) hold raw transcript + accounting rows and
+    must not be world/group readable. Called on the read-write open path so the
+    tightening is durable across recreation, not a one-shot manual fix. A umask
+    guard around DB creation (see ``__init__``) is the primary defence; this is
+    belt-and-suspenders for a file that predates the guard.
+    """
+    for suffix in ("", "-wal", "-shm"):
+        target = Path(str(db_path) + suffix)
+        try:
+            if target.exists():
+                os.chmod(target, 0o600)
+        except OSError as exc:
+            # Don't swallow silently — a failure here means a readable DB.
+            logger.debug("chmod 0600 failed for %s: %s", target, exc)
+
 
 # Cap on user-controlled FTS5 query input before regex/sanitizer processing.
 # Search queries do not need to be arbitrarily large, and bounding them keeps
@@ -933,6 +990,12 @@ class SessionDB:
 
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
+            # Create state.db (and any WAL/SHM sidecars SQLite opens under this
+            # umask) as 0600 from birth — no 0644 window between create and the
+            # chmod below. Restored in the finally so we don't leak the tighter
+            # umask into the rest of the process. (S6)
+            _prev_umask = os.umask(0o077)
+
             def _connect_and_init():
                 self._conn = sqlite3.connect(
                     str(self.db_path),
@@ -952,30 +1015,39 @@ class SessionDB:
                 self._init_schema()
 
             try:
-                _connect_and_init()
-            except sqlite3.DatabaseError as exc:
-                # The malformed-schema class (e.g. a duplicate sqlite_master
-                # row for messages_fts) fails on the very first statement —
-                # before _init_schema can run — so it can't be caught at the
-                # FTS-rebuild layer. Recover by repairing sqlite_master in
-                # place (backup first; canonical sessions/messages preserved),
-                # then reopen once. This is what lets Desktop/Dashboard
-                # self-heal instead of silently showing "no sessions".
-                if not is_malformed_db_error(exc) or not _claim_repair_attempt(self.db_path):
-                    raise
-                logger.error(
-                    "state.db schema is malformed (%s) — attempting automatic "
-                    "repair (a backup copy is made first).", exc,
-                )
                 try:
-                    if self._conn is not None:
-                        self._conn.close()
-                except Exception:
-                    pass
-                report = repair_state_db_schema(self.db_path)
-                if not report.get("repaired"):
-                    raise
-                _connect_and_init()
+                    _connect_and_init()
+                except sqlite3.DatabaseError as exc:
+                    # The malformed-schema class (e.g. a duplicate sqlite_master
+                    # row for messages_fts) fails on the very first statement —
+                    # before _init_schema can run — so it can't be caught at the
+                    # FTS-rebuild layer. Recover by repairing sqlite_master in
+                    # place (backup first; canonical sessions/messages preserved),
+                    # then reopen once. This is what lets Desktop/Dashboard
+                    # self-heal instead of silently showing "no sessions".
+                    if not is_malformed_db_error(exc) or not _claim_repair_attempt(self.db_path):
+                        raise
+                    logger.error(
+                        "state.db schema is malformed (%s) — attempting automatic "
+                        "repair (a backup copy is made first).", exc,
+                    )
+                    try:
+                        if self._conn is not None:
+                            self._conn.close()
+                    except Exception:
+                        pass
+                    report = repair_state_db_schema(self.db_path)
+                    if not report.get("repaired"):
+                        raise
+                    _connect_and_init()
+
+                # Tighten perms on every read-write open so a DB (re)created 0644
+                # by umask is durably narrowed to 0600. Cheap, idempotent.
+                _ensure_db_file_perms(self.db_path)
+            finally:
+                # Always restore — WAL/SHM are created during init above, so the
+                # tighter umask must stay in force until here, then never leak.
+                os.umask(_prev_umask)
         except Exception as exc:
             # Capture the cause so /resume and friends can surface WHY the
             # session DB is unavailable instead of a bare "Session database
@@ -3469,18 +3541,39 @@ class SessionDB:
         platform-specific flows like yuanbao's recall guard to redact a
         message by its platform-side identifier.
         """
-        # Serialize structured fields to JSON before entering the write txn
+        # Write-boundary secret scrub (fail-closed): mask credentials in every
+        # free-text AND serialized-payload field before anything is written to
+        # disk. state.db is the canonical message store, so this is the primary
+        # chokepoint that keeps raw secrets out of persisted transcripts, out of
+        # FTS re-emission, and out of the reasoning/codex payloads. Scrubbing
+        # the structured fields as OBJECTS (before json.dumps) catches secrets
+        # that would be JSON-escaped in the serialized string. Structured
+        # tool_calls are left intact to preserve replay fidelity (adjudicated
+        # deferral).
+        _scrubbed = _scrub_record_for_storage({
+            "content": content,
+            "reasoning": reasoning,
+            "reasoning_content": reasoning_content,
+            "reasoning_details": reasoning_details,
+            "codex_reasoning_items": codex_reasoning_items,
+            "codex_message_items": codex_message_items,
+        })
+        content = _scrubbed["content"]
+        reasoning = _scrubbed["reasoning"]
+        reasoning_content = _scrubbed["reasoning_content"]
+
+        # Serialize structured fields to JSON after the scrub.
         reasoning_details_json = (
-            json.dumps(reasoning_details)
-            if reasoning_details else None
+            json.dumps(_scrubbed["reasoning_details"])
+            if _scrubbed["reasoning_details"] else None
         )
         codex_items_json = (
-            json.dumps(codex_reasoning_items)
-            if codex_reasoning_items else None
+            json.dumps(_scrubbed["codex_reasoning_items"])
+            if _scrubbed["codex_reasoning_items"] else None
         )
         codex_message_items_json = (
-            json.dumps(codex_message_items)
-            if codex_message_items else None
+            json.dumps(_scrubbed["codex_message_items"])
+            if _scrubbed["codex_message_items"] else None
         )
         tool_calls_json = json.dumps(tool_calls) if tool_calls else None
         # Multimodal content (list of parts) must be JSON-encoded: sqlite3
@@ -3579,14 +3672,36 @@ class SessionDB:
             codex_message_items = (
                 msg.get("codex_message_items") if role == "assistant" else None
             )
+
+            # Write-boundary secret scrub (fail-closed) — same shared record
+            # scrubber as append_message, covering the serialized reasoning/
+            # codex payloads as well as the free-text fields. This helper backs
+            # BOTH replace_messages and archive_and_compact, so scrubbing here
+            # closes every bulk-insert write path with one chokepoint.
+            _scrubbed = _scrub_record_for_storage({
+                "content": msg.get("content"),
+                "reasoning": msg.get("reasoning") if role == "assistant" else None,
+                "reasoning_content": (
+                    msg.get("reasoning_content") if role == "assistant" else None
+                ),
+                "reasoning_details": reasoning_details,
+                "codex_reasoning_items": codex_reasoning_items,
+                "codex_message_items": codex_message_items,
+            })
+            scrubbed_content = _scrubbed["content"]
+            scrubbed_reasoning = _scrubbed["reasoning"]
+            scrubbed_reasoning_content = _scrubbed["reasoning_content"]
             reasoning_details_json = (
-                json.dumps(reasoning_details) if reasoning_details else None
+                json.dumps(_scrubbed["reasoning_details"])
+                if _scrubbed["reasoning_details"] else None
             )
             codex_items_json = (
-                json.dumps(codex_reasoning_items) if codex_reasoning_items else None
+                json.dumps(_scrubbed["codex_reasoning_items"])
+                if _scrubbed["codex_reasoning_items"] else None
             )
             codex_message_items_json = (
-                json.dumps(codex_message_items) if codex_message_items else None
+                json.dumps(_scrubbed["codex_message_items"])
+                if _scrubbed["codex_message_items"] else None
             )
             tool_calls_json = json.dumps(tool_calls) if tool_calls else None
             # Accept either `platform_message_id` (new explicit name) or
@@ -3604,15 +3719,15 @@ class SessionDB:
                 (
                     session_id,
                     role,
-                    self._encode_content(msg.get("content")),
+                    self._encode_content(scrubbed_content),
                     msg.get("tool_call_id"),
                     tool_calls_json,
                     msg.get("tool_name"),
                     message_timestamp,
                     msg.get("token_count"),
                     msg.get("finish_reason"),
-                    msg.get("reasoning") if role == "assistant" else None,
-                    msg.get("reasoning_content") if role == "assistant" else None,
+                    scrubbed_reasoning,
+                    scrubbed_reasoning_content,
                     reasoning_details_json,
                     codex_items_json,
                     codex_message_items_json,
@@ -4818,15 +4933,19 @@ class SessionDB:
                         else:
                             preview = ""
                         context_msgs.append(
-                            {"role": r["role"], "content": preview[:200]}
+                            {"role": r["role"], "content": _redact_persisted_text(preview[:200])}
                         )
                 match["context"] = context_msgs
             except Exception:
                 match["context"] = []
 
-        # Remove full content from result (snippet is enough, saves tokens)
+        # Remove full content from result (snippet is enough, saves tokens),
+        # and scrub the snippet so historical rows persisted before the
+        # write-boundary redactor cannot resurface a raw secret via search.
         for match in matches:
             match.pop("content", None)
+            if isinstance(match.get("snippet"), str):
+                match["snippet"] = _redact_persisted_text(match["snippet"])
 
         return matches
 

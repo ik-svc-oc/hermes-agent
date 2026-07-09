@@ -15,6 +15,24 @@ def test_show_status_all_does_not_print_tavily_key_value(monkeypatch, capsys, tm
     assert sentinel not in output
 
 
+def test_show_status_all_flag_never_reveals_raw_key(monkeypatch, capsys, tmp_path):
+    """`--all` promises "redacted for sharing" — the raw value must never print.
+
+    Regression for J-P0a: previously `--all` bypassed redaction and printed
+    provider keys verbatim while the help text claimed they were redacted. This
+    asserts both halves: the raw key is absent AND the masked form is shown.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    raw = "tvly-SUPERSECRETVALUE1234567890"
+    monkeypatch.setenv("TAVILY_API_KEY", raw)
+
+    show_status(SimpleNamespace(all=True, deep=False))
+
+    output = capsys.readouterr().out
+    assert raw not in output, "status --all leaked a raw provider key"
+    assert "tvly...7890" in output  # masked form still shown
+
+
 def test_show_status_termux_gateway_section_skips_systemctl(monkeypatch, capsys, tmp_path):
     from hermes_cli import status as status_mod
     import hermes_cli.auth as auth_mod

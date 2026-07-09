@@ -1046,3 +1046,198 @@ class TestRedactCdpUrl:
 
     def test_none_returns_empty(self):
         assert redact_cdp_url(None) == ""
+
+
+class TestExtendedPrefixes:
+    """glsa_/phx_/phc_ added for Grafana + PostHog (J-P0b)."""
+
+    def test_grafana_service_account_token(self):
+        key = "glsa_" + "a" * 30
+        result = redact_sensitive_text(f"grafana {key} x", force=True)
+        assert key not in result
+        assert "glsa_a" in result
+
+    def test_posthog_personal_key(self):
+        key = "phx_" + "b" * 30
+        result = redact_sensitive_text(f"posthog {key} x", force=True)
+        assert key not in result
+
+    def test_posthog_project_key(self):
+        key = "phc_" + "c" * 30
+        result = redact_sensitive_text(f"posthog {key} x", force=True)
+        assert key not in result
+
+
+class TestTelegramFloor:
+    def test_six_digit_prefix_now_matches(self):
+        token = "123456:" + "D" * 36
+        result = redact_sensitive_text(f"bot {token} x", force=True)
+        assert token not in result
+        assert "123456:***" in result
+
+
+class TestEnvValueDenylist:
+    """Opaque secrets caught by exact value from the env files (J-P0b)."""
+
+    def test_opaque_value_masked(self, tmp_path, monkeypatch):
+        import agent.redact as redact
+        opaque = "Zx9Qw7Rt2LmN8Pv0kLwEeRt"
+        env_file = tmp_path / "seed.env"
+        env_file.write_text(f'API_TOKEN="{opaque}"\nSHORT=ab\n', encoding="utf-8")
+        monkeypatch.setattr(redact, "_ENV_DENYLIST_FILES", (str(env_file),))
+        monkeypatch.setattr(redact, "_REDACT_ENABLED", True)
+        redact.reset_denylist_cache()
+        try:
+            result = redact.redact_for_storage(f"leaked {opaque} here")
+            assert opaque not in result
+            assert "leaked" in result
+            # Short values (< 8 chars) must never enter the denylist.
+            assert redact.redact_for_storage("value ab here") == "value ab here"
+        finally:
+            redact.reset_denylist_cache()
+
+    def test_missing_env_files_is_noop(self, tmp_path, monkeypatch):
+        import agent.redact as redact
+        monkeypatch.setattr(
+            redact, "_ENV_DENYLIST_FILES", (str(tmp_path / "does-not-exist"),)
+        )
+        monkeypatch.setattr(redact, "_REDACT_ENABLED", True)
+        redact.reset_denylist_cache()
+        try:
+            assert redact.redact_for_storage("plain text") == "plain text"
+        finally:
+            redact.reset_denylist_cache()
+
+
+class TestStorageRepairFixes:
+    """J-P0b repair: B2/B3/B4/B5 + S1/S2/S4/S5 for the at-rest scrub path."""
+
+    def _seed(self, tmp_path, monkeypatch, body):
+        import agent.redact as redact
+        env = tmp_path / "seed.env"
+        env.write_text(body, encoding="utf-8")
+        monkeypatch.setattr(redact, "_ENV_DENYLIST_FILES", (str(env),))
+        monkeypatch.setattr(redact, "_REDACT_ENABLED", True)
+        monkeypatch.delenv("HERMES_REDACT_SECRETS", raising=False)
+        redact.reset_denylist_cache()
+        return redact, env
+
+    def test_b2_ignores_non_secret_named_keys(self, tmp_path, monkeypatch):
+        redact, _ = self._seed(
+            tmp_path, monkeypatch,
+            "MODEL=gpt-5.5-preview-longname\n"
+            "PROJECT_ID=proj_abcdefghij123456\n"
+            "CORS_ORIGINS=https://a.example.com,https://b.example.com\n"
+            "OPENAI_API_KEY=Zx9Qw7Rt2LmN8Pv0kLwEeRt\n",
+        )
+        try:
+            # Non-secret-named values pass through untouched.
+            for keep in ("gpt-5.5-preview-longname", "proj_abcdefghij123456",
+                         "https://a.example.com"):
+                assert keep in redact.redact_for_storage(f"x {keep} y", force=True)
+            # Secret-named value is masked.
+            assert "Zx9Qw7Rt2LmN8Pv0kLwEeRt" not in redact.redact_for_storage(
+                "x Zx9Qw7Rt2LmN8Pv0kLwEeRt y", force=True)
+        finally:
+            redact.reset_denylist_cache()
+
+    def test_s2_strips_inline_comment_but_masks_value(self, tmp_path, monkeypatch):
+        redact, _ = self._seed(
+            tmp_path, monkeypatch,
+            "FAL_KEY=falopaque12345678   # this is a comment\n",
+        )
+        try:
+            out = redact.redact_for_storage("using falopaque12345678 now", force=True)
+            assert "falopaque12345678" not in out
+        finally:
+            redact.reset_denylist_cache()
+
+    def test_b3_force_scrubs_even_when_globally_disabled(self, tmp_path, monkeypatch):
+        redact, _ = self._seed(
+            tmp_path, monkeypatch, "API_TOKEN=Zx9Qw7Rt2LmN8Pv0kLwEeRt\n")
+        monkeypatch.setattr(redact, "_REDACT_ENABLED", False)  # opt-out ON
+        try:
+            # force=True (storage boundary) still scrubs.
+            assert "Zx9Qw7Rt2LmN8Pv0kLwEeRt" not in redact.scrub_text_for_storage(
+                "x Zx9Qw7Rt2LmN8Pv0kLwEeRt")
+            # force=False (display path) honours the opt-out.
+            assert "Zx9Qw7Rt2LmN8Pv0kLwEeRt" in redact.redact_for_storage(
+                "x Zx9Qw7Rt2LmN8Pv0kLwEeRt", force=False)
+        finally:
+            redact.reset_denylist_cache()
+
+    def test_b4_fail_closed_returns_placeholder(self, monkeypatch):
+        import agent.redact as redact
+        monkeypatch.setattr(
+            redact, "redact_for_storage",
+            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+        assert redact.scrub_text_for_storage("x") == redact.REDACTION_ERROR_PLACEHOLDER
+        monkeypatch.setattr(
+            redact, "redact_message_content",
+            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+        assert redact.scrub_content_for_storage("x") == redact.REDACTION_ERROR_PLACEHOLDER
+
+    def test_b5_structured_payload_recursively_masked(self, tmp_path, monkeypatch):
+        redact, _ = self._seed(
+            tmp_path, monkeypatch, "SECRET_TOKEN=Zx9Qw7Rt2LmN8Pv0kLwEeRt\n")
+        try:
+            payload = {"items": [{"text": "leak Zx9Qw7Rt2LmN8Pv0kLwEeRt"},
+                                 {"note": "ghp_" + "A" * 30}]}
+            out = redact.scrub_structured_for_storage(payload)
+            blob = repr(out)
+            assert "Zx9Qw7Rt2LmN8Pv0kLwEeRt" not in blob
+            assert "ghp_" + "A" * 30 not in blob
+            # Structure preserved.
+            assert isinstance(out["items"], list) and len(out["items"]) == 2
+        finally:
+            redact.reset_denylist_cache()
+
+    def test_s1_denylist_rebuilds_on_env_file_change(self, tmp_path, monkeypatch):
+        import time as _t
+        redact, env = self._seed(
+            tmp_path, monkeypatch, "API_TOKEN=firstsecret1234567\n")
+        try:
+            assert "firstsecret1234567" not in redact.redact_for_storage(
+                "x firstsecret1234567", force=True)
+            # Rotate the credential; mtime advances → cache rebuilds, no reset.
+            _t.sleep(0.01)
+            env.write_text("API_TOKEN=secondsecret7654321\n", encoding="utf-8")
+            out = redact.redact_for_storage(
+                "a secondsecret7654321 b firstsecret1234567", force=True)
+            assert "secondsecret7654321" not in out  # new secret now masked
+        finally:
+            redact.reset_denylist_cache()
+
+    def test_s4_denylist_runs_before_shape_patterns(self, tmp_path, monkeypatch):
+        # A value that is BOTH an env secret and matches a shape prefix. Whatever
+        # the ordering, the full value must be gone (no exposed tail).
+        redact, _ = self._seed(
+            tmp_path, monkeypatch, "GITHUB_TOKEN=ghp_" + "Z" * 34 + "\n")
+        try:
+            tok = "ghp_" + "Z" * 34
+            out = redact.redact_for_storage(f"tok {tok} end", force=True)
+            assert tok not in out
+            assert "Z" * 20 not in out
+        finally:
+            redact.reset_denylist_cache()
+
+    def test_s5_sendgrid_full_token_masked(self):
+        from agent.redact import redact_sensitive_text
+        sg = "SG.abcdefghij1234567890.klmnopqrstuvwxyz1234567890ABCDEFGH"
+        out = redact_sensitive_text(f"key {sg} x", force=True)
+        assert sg not in out
+        # The second dot-segment must not leak.
+        assert "klmnopqrstuvwxyz1234567890ABCDEFGH" not in out
+
+    def test_s5_base64url_chars_in_grafana_posthog(self):
+        from agent.redact import redact_sensitive_text
+        for key in ("glsa_ab-cd_ef-gh12345678", "phx_ab-cd_ef-gh12345678",
+                    "phc_ab-cd_ef-gh12345678"):
+            out = redact_sensitive_text(f"tok {key} x", force=True)
+            assert key not in out, key
+
+    def test_s5_authorization_pregate_case_insensitive(self):
+        from agent.redact import redact_sensitive_text
+        out = redact_sensitive_text(
+            "AUTHORIZATION: Bearer sometokenvalue1234567890", force=True)
+        assert "sometokenvalue1234567890" not in out
