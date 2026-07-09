@@ -429,7 +429,30 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         source_url="https://api-docs.deepseek.com/quick_start/pricing",
         pricing_version="deepseek-pricing-2026-05-12",
     ),
-    # Google Gemini
+    # Google Gemini.
+    # The live OAuth Gemini route (generativelanguage.googleapis.com) resolves
+    # to provider "gemini" — see resolve_billing_route — so the model Hermes
+    # actually serves, gemini-3.1-pro-preview, must be keyed under "gemini" to
+    # be found. The "google" keys below only match the inferred "google/<model>"
+    # model-string path and never reach the OAuth sessions, which is why those
+    # sessions previously priced "unknown"/$0. Cache-read/write rates are
+    # required: Gemini reports cache tokens and estimate_usage_cost refuses to
+    # price a route whose entry lacks a cache rate. The long-context (>200k
+    # prompt) tier is a separate $4/$18 rate on the same page, omitted here
+    # because this flat (provider, model) table has no per-request tier
+    # mechanism.
+    (
+        "gemini",
+        "gemini-3.1-pro-preview",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("2.00"),
+        output_cost_per_million=Decimal("12.00"),
+        cache_read_cost_per_million=Decimal("0.20"),
+        cache_write_cost_per_million=Decimal("2.00"),
+        source="official_docs_snapshot",
+        source_url="https://ai.google.dev/gemini-api/docs/pricing",
+        pricing_version="google-pricing-2026-06-08",
+    ),
     (
         "google",
         "gemini-2.5-pro",

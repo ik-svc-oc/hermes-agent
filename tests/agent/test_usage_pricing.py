@@ -334,3 +334,56 @@ def test_bedrock_claude_cached_session_estimates_cost_not_unknown():
     )
     assert result.status == "estimated"
     assert result.amount_usd is not None
+
+
+def test_gemini_3_1_pro_preview_pricing_entry_exists():
+    """Regression: gemini-3.1-pro-preview must have an official-docs entry.
+
+    The live OAuth Gemini route records provider ``gemini`` (not ``google``),
+    so the entry must be keyed under ``gemini`` or OAuth Gemini sessions price
+    as ``unknown``/$0 in hermes insights. Rates: standard <=200k tier,
+    input $2 / output $12 / cache-read $0.20 / cache-write $2 per MTok
+    (https://ai.google.dev/gemini-api/docs/pricing).
+    """
+    entry = get_pricing_entry("gemini-3.1-pro-preview", provider="gemini")
+
+    assert entry is not None
+    assert float(entry.input_cost_per_million) == 2.0
+    assert float(entry.output_cost_per_million) == 12.0
+    # Cache rates are mandatory: Gemini reports cache tokens and
+    # estimate_usage_cost refuses to price a route with no cache rate.
+    assert float(entry.cache_read_cost_per_million) == 0.2
+    assert float(entry.cache_write_cost_per_million) == 2.0
+
+
+def test_gemini_3_1_pro_preview_oauth_session_estimates_cost_not_unknown(monkeypatch):
+    """A live OAuth Gemini session (provider ``gemini``, generativelanguage
+    base URL) with cache hits must produce a dollar estimate, not ``unknown``.
+
+    The endpoint models API carries no pricing for this route, so pricing must
+    fall through to the official-docs snapshot. Stub the endpoint metadata as
+    empty to reproduce that fall-through deterministically (no network).
+    """
+    monkeypatch.setattr(
+        "agent.usage_pricing.fetch_endpoint_model_metadata",
+        lambda base_url, api_key=None: {},
+    )
+
+    usage = CanonicalUsage(
+        input_tokens=1_000_000,
+        output_tokens=1_000_000,
+        cache_read_tokens=1_000_000,
+        cache_write_tokens=1_000_000,
+    )
+    result = estimate_usage_cost(
+        "gemini-3.1-pro-preview",
+        usage,
+        provider="gemini",
+        base_url="https://generativelanguage.googleapis.com/v1beta",
+    )
+
+    assert result.status == "estimated"
+    assert result.source == "official_docs_snapshot"
+    # 1M each of input/output/cache-read/cache-write:
+    # 2.00 + 12.00 + 0.20 + 2.00 = 16.20
+    assert float(result.amount_usd) == 16.20
