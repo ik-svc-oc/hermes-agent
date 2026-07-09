@@ -29,6 +29,7 @@ shape with no mode parameter, no summary LLM path, and explicit scroll
 support.
 """
 
+import functools
 import json
 import logging
 from typing import Any, Dict, List, Optional, Union
@@ -616,7 +617,7 @@ def _discover(
     }, ensure_ascii=False)
 
 
-def session_search(
+def _session_search_impl(
     query: str = "",
     role_filter: str = None,
     limit: int = 3,
@@ -738,6 +739,41 @@ def session_search(
         sort=sort_norm,
         current_session_id=current_session_id,
     )
+
+
+@functools.wraps(_session_search_impl)
+def session_search(*args, **kwargs) -> str:
+    """Secret-scrubbing wrapper over :func:`_session_search_impl`.
+
+    Every shape returns a JSON string built from stored message content, so
+    historical rows persisted before the write-boundary redactor could still
+    resurface a raw secret through search/read/browse/scroll. We scrub the
+    PARSED structure (not the raw string) so a secret that was JSON-escaped in
+    the serialized form — embedded quotes / newlines — is still caught (S3),
+    then re-serialize. Redaction is forced (the display-only opt-out must not
+    weaken a re-emit boundary) and fails CLOSED: any fault withholds the result
+    rather than returning it unredacted (B4).
+    """
+    result = _session_search_impl(*args, **kwargs)
+    if not isinstance(result, str):
+        return result
+    try:
+        from agent.redact import (
+            redact_for_storage,
+            scrub_structured_for_storage,
+        )
+        try:
+            parsed = json.loads(result)
+        except (ValueError, TypeError):
+            # Not JSON — scrub the raw string (still forced + fail-closed).
+            return redact_for_storage(result, force=True)
+        scrubbed = scrub_structured_for_storage(parsed)
+        return json.dumps(scrubbed, ensure_ascii=False)
+    except Exception:
+        logging.exception("session_search redaction failed; withholding result")
+        return json.dumps(
+            {"success": False, "error": "[REDACTION-ERROR] search result withheld"}
+        )
 
 
 def check_session_search_requirements() -> bool:

@@ -147,7 +147,12 @@ from tools.browser_tool import cleanup_browser
 # Agent internals extracted to agent/ package for modularity
 from agent.memory_manager import sanitize_context
 from agent.error_classifier import FailoverReason
-from agent.redact import redact_sensitive_text
+from agent.redact import (
+    redact_sensitive_text,
+    scrub_content_for_storage,
+    scrub_record_for_storage,
+    scrub_text_for_storage,
+)
 from agent.model_metadata import (
     estimate_request_tokens_rough,  # noqa: F401  # re-exported for tests that mock.patch("run_agent.estimate_request_tokens_rough")
     is_local_endpoint,
@@ -2497,33 +2502,20 @@ class AIAgent:
 
     @staticmethod
     def _redact_message_content(content):
-        """Apply secret redaction to message content (str or list-of-parts).
+        """Fail-closed scrub of message content (str or list-of-parts).
 
         Handles both plain-string content and the OpenAI/Anthropic multimodal
         shape where ``content`` is a list of ``{"type": "text", "text": ...}``
         / ``{"type": "image_url", ...}`` / ``{"type": "input_text", "content": ...}``
         parts. Image / binary parts are left untouched; only text fields are
-        passed through ``redact_sensitive_text``.
+        scrubbed.
 
-        Respects ``HERMES_REDACT_SECRETS`` via ``redact_sensitive_text`` —
-        when disabled the helper is effectively a no-op.
+        Uses ``scrub_content_for_storage`` (shape patterns + env-value denylist,
+        forced on and fail-closed) so the snapshot matches the state.db
+        write-boundary scrub and the display-only ``HERMES_REDACT_SECRETS``
+        opt-out cannot leave secrets at rest.
         """
-        if content is None:
-            return content
-        if isinstance(content, str):
-            return redact_sensitive_text(content)
-        if isinstance(content, list):
-            redacted = []
-            for part in content:
-                if isinstance(part, dict):
-                    part = dict(part)
-                    if isinstance(part.get("text"), str):
-                        part["text"] = redact_sensitive_text(part["text"])
-                    if isinstance(part.get("content"), str):
-                        part["content"] = redact_sensitive_text(part["content"])
-                redacted.append(part)
-            return redacted
-        return content
+        return scrub_content_for_storage(content)
 
     def _save_session_log(self, messages: List[Dict[str, Any]] = None):
         """Optional per-session JSON snapshot writer.
@@ -2568,14 +2560,13 @@ class AIAgent:
                 if msg.get("role") == "assistant" and msg.get("content"):
                     msg = dict(msg)
                     msg["content"] = self._clean_session_content(msg["content"])
-                # Defence-in-depth: redact credentials from every message
-                # content before persistence. Catches PATs / API keys / Bearer
-                # tokens that may have leaked into assistant responses, tool
-                # output, or user paste. Respects HERMES_REDACT_SECRETS via
-                # redact_sensitive_text — no-op when disabled. (#19798, #19845)
-                if "content" in msg:
-                    msg = dict(msg)
-                    msg["content"] = self._redact_message_content(msg.get("content"))
+                # Fail-closed secret scrub over the whole record — content AND
+                # reasoning / reasoning_content / serialized reasoning-codex
+                # payloads — via the SAME shared scrubber the state.db write path
+                # uses, so the snapshot and the DB never diverge on which fields
+                # are cleaned. Catches PATs / API keys / Bearer tokens / opaque
+                # env-values in assistant responses, tool output, or user paste.
+                msg = scrub_record_for_storage(msg)
                 cleaned.append(msg)
 
             # Guard: never overwrite a larger session log with fewer messages.
@@ -2601,7 +2592,7 @@ class AIAgent:
                 "platform": self.platform,
                 "session_start": self.session_start.isoformat(),
                 "last_updated": datetime.now().isoformat(),
-                "system_prompt": redact_sensitive_text(self._cached_system_prompt or ""),
+                "system_prompt": scrub_text_for_storage(self._cached_system_prompt or ""),
                 "tools": self.tools or [],
                 "message_count": len(cleaned),
                 "messages": cleaned,
@@ -2611,6 +2602,9 @@ class AIAgent:
                 log_file,
                 entry,
                 indent=2,
+                # Session snapshots carry full transcript content — create them
+                # 0600 so they are never group/world readable.
+                mode=0o600,
                 default=str,
             )
 

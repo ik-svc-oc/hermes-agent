@@ -638,3 +638,45 @@ class TestCronDemotion:
         # Interactive rows first, in original relative order; cron last, in
         # original relative order.
         assert [r["id"] for r in ordered] == [2, 4, 5, 1, 3]
+
+
+class TestSessionSearchSecretScrub:
+    """J-P0b repair S3 + B4: the tool wrapper scrubs re-emitted stored secrets."""
+
+    def test_escaped_legacy_secret_is_masked(self, db, tmp_path, monkeypatch):
+        import agent.redact as redact
+        # Opaque secret containing a double-quote → JSON-escaped in the raw tool
+        # output, so a raw-string regex would miss it; scrubbing the PARSED
+        # structure (S3) still catches it.
+        secret = 'ab"cd_opaque_legacy_1234567'
+        env = tmp_path / "seed.env"
+        env.write_text(f"API_TOKEN={secret}\n", encoding="utf-8")
+        monkeypatch.setattr(redact, "_ENV_DENYLIST_FILES", (str(env),))
+        monkeypatch.setattr(redact, "_REDACT_ENABLED", True)
+        redact.reset_denylist_cache()
+        try:
+            db.create_session("slg", source="cli")
+            # Legacy row: bypass append_message (which now scrubs at write).
+            db._conn.execute(
+                "INSERT INTO messages (session_id, role, content, timestamp) "
+                "VALUES (?,?,?,?)",
+                ("slg", "user", f"here is {secret} legacy", time.time()),
+            )
+            out = session_search(session_id="slg", db=db)
+            assert secret not in out, "tool re-emitted an escaped legacy secret"
+        finally:
+            redact.reset_denylist_cache()
+
+    def test_redaction_fault_fails_closed(self, db, monkeypatch):
+        import agent.redact as redact
+        _seed_modpack_sessions(db)
+
+        def _boom(*a, **k):
+            raise RuntimeError("redactor down")
+
+        monkeypatch.setattr(redact, "scrub_structured_for_storage", _boom)
+        monkeypatch.setattr(redact, "redact_for_storage", _boom)
+        out = session_search(query="modpack", db=db)
+        payload = json.loads(out)
+        assert payload.get("success") is False
+        assert "REDACTION-ERROR" in payload.get("error", "")

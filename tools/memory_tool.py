@@ -219,6 +219,11 @@ class MemoryStore:
         """
         from tools.threat_patterns import scan_for_threats
 
+        try:
+            from agent.redact import scrub_text_for_storage
+        except Exception:
+            scrub_text_for_storage = None
+
         sanitized: List[str] = []
         for entry in entries:
             if not entry or entry.startswith("[BLOCKED:"):
@@ -236,8 +241,22 @@ class MemoryStore:
                     f"use memory(action=remove) "
                     f"to delete the original.]"
                 )
-            else:
-                sanitized.append(entry)
+                continue
+            # Scrub credentials from the snapshot copy that gets injected into
+            # the system prompt (and re-emitted). Forced + fail-closed: on a
+            # redactor fault the entry is withheld rather than injected raw.
+            # Live state keeps the original so the user can still inspect +
+            # remove it via the tool.
+            if scrub_text_for_storage is not None:
+                try:
+                    entry = scrub_text_for_storage(entry)
+                except Exception:
+                    logger.exception(
+                        "Memory snapshot redaction faulted for %s; withholding entry",
+                        filename,
+                    )
+                    entry = "[REDACTION-ERROR: memory entry withheld from system prompt]"
+            sanitized.append(entry)
         return sanitized
 
     @staticmethod
