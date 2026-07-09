@@ -205,6 +205,7 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
                 if cost_result.amount_usd is not None else None,
                 cost_status=cost_result.status,
                 cost_source=cost_result.source,
+                pricing_version=cost_result.pricing_version,
                 billing_provider=agent.provider,
                 billing_base_url=agent.base_url,
                 billing_mode="subscription_included"

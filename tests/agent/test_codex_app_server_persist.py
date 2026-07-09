@@ -28,7 +28,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from agent.codex_runtime import run_codex_app_server_turn
+from agent.codex_runtime import _record_codex_app_server_usage, run_codex_app_server_turn
 from hermes_state import SessionDB
 from run_agent import AIAgent
 
@@ -131,6 +131,47 @@ def test_codex_turn_persists_each_message_exactly_once():
         import shutil
 
         shutil.rmtree(tmp)
+
+
+def test_codex_usage_persists_pricing_version_for_included_route():
+    """Codex app-server accounting must persist pricing provenance."""
+    db = MagicMock()
+    agent = SimpleNamespace(
+        model="gpt-5.5",
+        provider="openai-codex",
+        base_url="https://chatgpt.com/backend-api/codex",
+        api_key="test-key",
+        session_id="sess-codex-pricing",
+        _session_db=db,
+        _session_db_created=True,
+        _ensure_db_session=MagicMock(),
+        session_api_calls=0,
+        session_prompt_tokens=0,
+        session_completion_tokens=0,
+        session_total_tokens=0,
+        session_input_tokens=0,
+        session_output_tokens=0,
+        session_cache_read_tokens=0,
+        session_cache_write_tokens=0,
+        session_reasoning_tokens=0,
+        session_estimated_cost_usd=0.0,
+        session_cost_status=None,
+        session_cost_source=None,
+        context_compressor=None,
+    )
+    turn = SimpleNamespace(
+        token_usage_last={
+            "inputTokens": 1000,
+            "cachedInputTokens": 0,
+            "outputTokens": 10,
+            "reasoningOutputTokens": 0,
+            "totalTokens": 1010,
+        }
+    )
+
+    _record_codex_app_server_usage(agent, turn)
+
+    assert db.update_token_counts.call_args.kwargs["pricing_version"] == "included-route"
 
 
 class TestGatewayPersistedResolution:
