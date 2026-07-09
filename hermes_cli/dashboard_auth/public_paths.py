@@ -26,7 +26,9 @@ entry should be safe to expose to:
   * anyone who happens to ``curl`` the hostname.
 
 If a new endpoint doesn't pass all three tests, it should be gated and
-the SPA should bootstrap it after login instead.
+the SPA should bootstrap it after login instead. A narrow exception exists
+for gateway-facing plugin routes that enforce their own non-dashboard auth
+contract, such as ``ttm-control-plane``.
 """
 from __future__ import annotations
 
@@ -53,3 +55,24 @@ PUBLIC_API_PATHS: frozenset[str] = frozenset({
     # 401 no_cookie. The JWT — not this allowlist — is the security boundary.
     "/api/cron/fire",
 })
+
+PUBLIC_API_PREFIXES: frozenset[str] = frozenset({
+    # TTM calls this dashboard plugin from a backend runtime adapter, not from
+    # the browser dashboard. The plugin owns its own auth boundary:
+    # ``/health`` is a liveness probe and mutating routes require
+    # ``X-TTM-Control-Plane-Secret``. Keep this prefix narrow; do not expose
+    # arbitrary dashboard plugins.
+    "/api/plugins/ttm-control-plane/",
+})
+
+
+def is_public_api_path(path: str) -> bool:
+    """Return true when ``path`` bypasses dashboard-level auth.
+
+    Exact path matches remain exact to avoid exposing extensions such as
+    ``/api/status/secret``. Prefix matches are reserved for plugin-owned auth
+    boundaries that need backend-to-dashboard traffic without a browser session.
+    """
+    if path in PUBLIC_API_PATHS:
+        return True
+    return any(path.startswith(prefix) for prefix in PUBLIC_API_PREFIXES)
