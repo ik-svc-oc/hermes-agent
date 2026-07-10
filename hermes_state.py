@@ -143,6 +143,24 @@ def _redact_persisted_text(value):
         return "[REDACTION-ERROR]"
 
 
+def _scrub_structured_for_storage(obj):
+    """Fail-CLOSED structured scrub of a JSON-ish payload bound for persistence.
+
+    Used for the sessions-table ``model_config`` blob (a dict/JSON string that
+    can carry provider secrets). Recursively scrubs every string leaf and, on
+    any redactor fault (including import failure), yields a placeholder rather
+    than the raw structure.
+    """
+    if obj is None:
+        return None
+    try:
+        from agent.redact import scrub_structured_for_storage
+        return scrub_structured_for_storage(obj)
+    except Exception:
+        logger.exception("structured redaction unavailable; failing closed")
+        return "[REDACTION-ERROR]"
+
+
 def _scrub_record_for_storage(record: Dict[str, Any]) -> Dict[str, Any]:
     """Fail-CLOSED scrub of a message record (content + reasoning + serialized
     reasoning/codex payloads) via the shared record scrubber."""
@@ -167,9 +185,10 @@ def _ensure_db_file_perms(db_path: "Path") -> None:
 
     state.db (and the machine-ledger) hold raw transcript + accounting rows and
     must not be world/group readable. Called on the read-write open path so the
-    tightening is durable across recreation, not a one-shot manual fix. A umask
-    guard around DB creation (see ``__init__``) is the primary defence; this is
-    belt-and-suspenders for a file that predates the guard.
+    tightening is durable across recreation, not a one-shot manual fix. The
+    0600 pre-create in ``__init__`` is the primary defence for the main DB file;
+    this narrows the WAL/SHM sidecars (created under the ambient umask) and any
+    legacy file that predates the pre-create.
     """
     for suffix in ("", "-wal", "-shm"):
         target = Path(str(db_path) + suffix)
@@ -990,11 +1009,29 @@ class SessionDB:
 
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
-            # Create state.db (and any WAL/SHM sidecars SQLite opens under this
-            # umask) as 0600 from birth — no 0644 window between create and the
-            # chmod below. Restored in the finally so we don't leak the tighter
-            # umask into the rest of the process. (S6)
-            _prev_umask = os.umask(0o077)
+            # Create state.db as 0600 from birth — no 0644 window between create
+            # and the chmod below — WITHOUT mutating the process-global umask.
+            # os.umask() is process-global and unsynchronised: two threads
+            # opening SessionDB concurrently (gateway / web_server instantiate
+            # one per request) would race on the set/restore and could leak the
+            # tightened umask into unrelated file creation elsewhere in the
+            # process, or restore a stale value (R4/S6). Instead pre-create the
+            # DB file with an explicit 0600 mode via os.open()+os.fchmod()
+            # (fchmod ignores umask), so sqlite3.connect below opens an
+            # already-existing 0600 file. WAL/SHM sidecars — created under the
+            # ambient umask during init — are narrowed by _ensure_db_file_perms
+            # immediately after.
+            try:
+                _fd = os.open(str(self.db_path), os.O_CREAT | os.O_RDWR, 0o600)
+                try:
+                    os.fchmod(_fd, 0o600)
+                finally:
+                    os.close(_fd)
+            except OSError as exc:
+                # Non-fatal: connect still succeeds and _ensure_db_file_perms
+                # narrows perms after init. Worst case is a brief 0644 window on
+                # a freshly created file — the same window the umask guard closed.
+                logger.debug("pre-create 0600 failed for %s: %s", self.db_path, exc)
 
             def _connect_and_init():
                 self._conn = sqlite3.connect(
@@ -1015,39 +1052,36 @@ class SessionDB:
                 self._init_schema()
 
             try:
+                _connect_and_init()
+            except sqlite3.DatabaseError as exc:
+                # The malformed-schema class (e.g. a duplicate sqlite_master
+                # row for messages_fts) fails on the very first statement —
+                # before _init_schema can run — so it can't be caught at the
+                # FTS-rebuild layer. Recover by repairing sqlite_master in
+                # place (backup first; canonical sessions/messages preserved),
+                # then reopen once. This is what lets Desktop/Dashboard
+                # self-heal instead of silently showing "no sessions".
+                if not is_malformed_db_error(exc) or not _claim_repair_attempt(self.db_path):
+                    raise
+                logger.error(
+                    "state.db schema is malformed (%s) — attempting automatic "
+                    "repair (a backup copy is made first).", exc,
+                )
                 try:
-                    _connect_and_init()
-                except sqlite3.DatabaseError as exc:
-                    # The malformed-schema class (e.g. a duplicate sqlite_master
-                    # row for messages_fts) fails on the very first statement —
-                    # before _init_schema can run — so it can't be caught at the
-                    # FTS-rebuild layer. Recover by repairing sqlite_master in
-                    # place (backup first; canonical sessions/messages preserved),
-                    # then reopen once. This is what lets Desktop/Dashboard
-                    # self-heal instead of silently showing "no sessions".
-                    if not is_malformed_db_error(exc) or not _claim_repair_attempt(self.db_path):
-                        raise
-                    logger.error(
-                        "state.db schema is malformed (%s) — attempting automatic "
-                        "repair (a backup copy is made first).", exc,
-                    )
-                    try:
-                        if self._conn is not None:
-                            self._conn.close()
-                    except Exception:
-                        pass
-                    report = repair_state_db_schema(self.db_path)
-                    if not report.get("repaired"):
-                        raise
-                    _connect_and_init()
+                    if self._conn is not None:
+                        self._conn.close()
+                except Exception:
+                    pass
+                report = repair_state_db_schema(self.db_path)
+                if not report.get("repaired"):
+                    raise
+                _connect_and_init()
 
-                # Tighten perms on every read-write open so a DB (re)created 0644
-                # by umask is durably narrowed to 0600. Cheap, idempotent.
-                _ensure_db_file_perms(self.db_path)
-            finally:
-                # Always restore — WAL/SHM are created during init above, so the
-                # tighter umask must stay in force until here, then never leak.
-                os.umask(_prev_umask)
+            # Tighten perms on every read-write open so a DB (re)created 0644
+            # (a legacy file predating the pre-create, or the WAL/SHM sidecars
+            # created under the ambient umask) is durably narrowed to 0600.
+            # Cheap, idempotent.
+            _ensure_db_file_perms(self.db_path)
         except Exception as exc:
             # Capture the cause so /resume and friends can surface WHY the
             # session DB is unavailable instead of a bare "Session database
@@ -1726,8 +1760,15 @@ class SessionDB:
                     chat_type,
                     thread_id,
                     model,
-                    json.dumps(model_config) if model_config else None,
-                    system_prompt,
+                    # Fail-closed scrub before persistence: model_config can
+                    # carry provider secrets; system_prompt is reachable from
+                    # API clients (gateway/platforms) and may embed pasted keys.
+                    (
+                        json.dumps(_scrub_structured_for_storage(model_config))
+                        if model_config
+                        else None
+                    ),
+                    _redact_persisted_text(system_prompt),
                     parent_session_id,
                     cwd,
                     time.time(),
@@ -2416,6 +2457,11 @@ class SessionDB:
         column unchanged.  Routes through _execute_write for the standard
         BEGIN IMMEDIATE + jitter-retry + lock guarantee.
         """
+        # Fail-closed scrub of the serialized model_config before persistence —
+        # it can carry provider secrets. scrub_text runs the env-value denylist
+        # + shape patterns over the JSON string and yields a placeholder on fault.
+        model_config_json = _redact_persisted_text(model_config_json)
+
         def _do(conn):
             conn.execute(
                 "UPDATE sessions SET model_config = ?, model = COALESCE(?, model) WHERE id = ?",
@@ -2425,6 +2471,10 @@ class SessionDB:
 
     def update_system_prompt(self, session_id: str, system_prompt: str) -> None:
         """Store the full assembled system prompt snapshot."""
+        # Fail-closed scrub before persistence — the assembled prompt is
+        # reachable from API clients and may embed pasted secrets.
+        system_prompt = _redact_persisted_text(system_prompt)
+
         def _do(conn):
             conn.execute(
                 "UPDATE sessions SET system_prompt = ? WHERE id = ?",
@@ -2783,7 +2833,11 @@ class SessionDB:
         or if the title fails validation (too long, invalid characters).
         Empty/whitespace-only strings are normalized to None (clearing the title).
         """
-        title = self.sanitize_title(title)
+        # Fail-closed scrub before persistence — titles are reachable from API
+        # clients (gateway/platforms) and may carry pasted secrets. Scrub first,
+        # then sanitize so the stored value (and the uniqueness check below) use
+        # the masked form and length validation applies to what is persisted.
+        title = self.sanitize_title(_redact_persisted_text(title))
         def _do(conn):
             if title:
                 # Check uniqueness (allow the same session to keep its own title)

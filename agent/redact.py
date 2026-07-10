@@ -828,21 +828,29 @@ class RedactingFormatter(logging.Formatter):
 # of the *actual* secret values loaded from the operator's env files and mask
 # any exact occurrence, regardless of shape.
 #
-# The denylist reads the two canonical env files directly rather than
-# os.environ so the match set is the operator's declared secrets, not every
-# inherited environment variable (PATH, HOME, …). It ALSO filters by
-# secret-like KEY NAME (B2): a bare ``MODEL=…`` / ``PROJECT_ID=…`` /
-# ``CORS_ORIGINS=…`` line has a long value but is not a secret, and masking its
-# value corrupts ordinary transcript text. Only values whose key looks like a
-# credential (KEY/TOKEN/SECRET/PASSWORD/CREDENTIAL/AUTH/…) enter the denylist.
+# The denylist reads the operator's env files directly rather than os.environ
+# so the match set is the operator's declared secrets, not every inherited
+# environment variable (PATH, HOME, …). It ALSO filters by secret-like KEY NAME
+# (B2): a bare ``MODEL=…`` / ``PROJECT_ID=…`` / ``CORS_ORIGINS=…`` line has a
+# long value but is not a secret, and masking its value corrupts ordinary
+# transcript text. Only values whose key looks like a credential
+# (KEY/TOKEN/SECRET/PASSWORD/CREDENTIAL/AUTH/…) enter the denylist.
+#
+# The scanned file set is resolved from the SAME machinery env_loader uses to
+# load secrets (R6): the HERMES_HOME-relative ``.env`` / ``.op.env`` plus the
+# machine-global managed-scope ``.env`` — resolved at scan time so a relocated
+# HERMES_HOME / active profile is honoured, not a hardcoded ``~/.hermes/.env``
+# that silently misses every non-default home. ``~/.env`` is always included.
 #
 # The compiled alternation is cached and rebuilt only when an env file's mtime
 # or size changes (S1), so rotating a credential is picked up without a restart
-# while steady-state persists stay a cheap two-``stat`` check.
+# while steady-state persists stay a cheap ``stat`` check.
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Files scanned for secret VALUES. Order is irrelevant — values are deduped.
-_ENV_DENYLIST_FILES = ("~/.env", "~/.hermes/.env")
+# Explicit override of the scanned file set. Default ``None`` means "auto-resolve
+# the HERMES_HOME-aware set" (see ``_env_denylist_paths``); tests set an explicit
+# tuple of paths to scan a fixture file in full isolation from the real machine.
+_ENV_DENYLIST_FILES = None
 
 # Values shorter than this are ignored: too likely to be a common word or a
 # non-secret flag ("true", "1", "prod") and too likely to false-positive on
@@ -913,11 +921,64 @@ def _parse_env_file_secrets(path: str) -> "list[str]":
     return values
 
 
+def _env_denylist_paths():
+    """Absolute env-file paths scanned for secret VALUES.
+
+    When ``_ENV_DENYLIST_FILES`` is set (tests), it is the exact override set —
+    scanned in full isolation from the real machine. Otherwise the set is
+    auto-resolved (R6) from the same files env_loader loads secrets from:
+
+      * ``<HERMES_HOME>/.env`` and ``<HERMES_HOME>/.op.env`` — resolved at scan
+        time via :func:`hermes_constants.get_hermes_home`, so a relocated
+        HERMES_HOME / active-profile override is honoured (the previous
+        hardcoded ``~/.hermes/.env`` missed every non-default home);
+      * the machine-global managed-scope ``.env``;
+      * ``~/.env`` (always included).
+
+    Deduped, order-preserving. Never raises — a resolver fault degrades to the
+    files it could resolve rather than breaking a persist/read path.
+    """
+    if _ENV_DENYLIST_FILES is not None:
+        out = []
+        for rel in _ENV_DENYLIST_FILES:
+            p = os.path.expanduser(str(rel))
+            if p not in out:
+                out.append(p)
+        return tuple(out)
+
+    paths: "list[str]" = []
+
+    def _add(candidate) -> None:
+        p = os.path.expanduser(str(candidate))
+        if p not in paths:
+            paths.append(p)
+
+    try:
+        from hermes_constants import get_hermes_home
+        home = get_hermes_home()
+        _add(home / ".env")
+        _add(home / ".op.env")
+    except Exception:
+        logger.debug("denylist: HERMES_HOME resolution unavailable", exc_info=True)
+    try:
+        from hermes_cli import managed_scope
+        managed_dir = managed_scope.get_managed_dir()
+        if managed_dir is not None:
+            _add(managed_dir / ".env")
+    except Exception:
+        logger.debug("denylist: managed-scope resolution unavailable", exc_info=True)
+    _add("~/.env")
+    return tuple(paths)
+
+
 def _env_files_signature():
-    """(path, mtime_ns, size) per env file — cheap change detector for S1."""
+    """(path, mtime_ns, size) per env file — cheap change detector for S1.
+
+    Includes the resolved path set itself in the signature so a HERMES_HOME
+    relocation (which changes WHICH files are scanned) forces a rebuild too.
+    """
     sig = []
-    for rel in _ENV_DENYLIST_FILES:
-        p = os.path.expanduser(rel)
+    for p in _env_denylist_paths():
         try:
             st = os.stat(p)
             sig.append((p, st.st_mtime_ns, st.st_size))
@@ -929,8 +990,8 @@ def _env_files_signature():
 def _build_denylist_regex():
     """Compile a single alternation of every env secret value. None if empty."""
     seen = set()
-    for rel in _ENV_DENYLIST_FILES:
-        for value in _parse_env_file_secrets(os.path.expanduser(rel)):
+    for p in _env_denylist_paths():
+        for value in _parse_env_file_secrets(p):
             seen.add(value)
     if not seen:
         return None
@@ -1029,6 +1090,13 @@ def redact_message_content(content, *, force: bool = False):
                     part["content"] = redact_for_storage(part["content"], force=force)
             redacted.append(part)
         return redacted
+    if isinstance(content, (dict, tuple)):
+        # A bare dict/tuple content shape is still structured data that the
+        # state.db writer (_encode_content) JSON-serializes verbatim, so a raw
+        # secret nested in it would bypass the write-boundary scrub (R3). Walk
+        # every string leaf recursively, honouring ``force`` like the list
+        # branch above.
+        return redact_structured_for_storage(content, force=force)
     return content
 
 

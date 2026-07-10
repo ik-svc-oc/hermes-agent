@@ -197,7 +197,11 @@ class TestDbFilePerms:
             s.close()
 
     def test_wal_shm_sidecars_created_0600(self, tmp_path):
-        """S6: the umask guard means WAL/SHM sidecars are born 0600 too."""
+        """S6/R4: WAL/SHM sidecars end up 0600 via _ensure_db_file_perms.
+
+        The main DB file is pre-created 0600 (no process-global umask mutation);
+        the sidecars are narrowed by _ensure_db_file_perms on the read-write open.
+        """
         db_path = tmp_path / "perms_wal_state.db"
         s = SessionDB(db_path=db_path)
         try:
