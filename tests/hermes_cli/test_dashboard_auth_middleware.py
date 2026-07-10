@@ -107,6 +107,46 @@ def test_other_public_api_paths_are_public_under_gate(gated_app, path):
         )
 
 
+def test_gated_ttm_control_plane_prefix_is_public(gated_app):
+    """TTM's backend runtime adapter calls
+    ``/api/plugins/ttm-control-plane/*`` without a dashboard cookie; the
+    plugin owns its own auth boundary (``X-TTM-Control-Plane-Secret``).
+    The OAuth gate must let the prefix through via
+    :data:`PUBLIC_API_PREFIXES` instead of 401-ing it. A non-401,
+    non-login-redirect status proves the auth bypass (the route itself may
+    404 when unmounted/disabled — that's a routing concern, not an auth
+    failure).
+    """
+    r = gated_app.get(
+        "/api/plugins/ttm-control-plane/health", follow_redirects=False
+    )
+    assert r.status_code != 401, (
+        "ttm-control-plane prefix 401'd under the OAuth gate — the "
+        "public-path exception is not wired into is_public_api_path()"
+    )
+    if r.status_code == 302:
+        location = r.headers.get("location", "")
+        assert "/login" not in location, (
+            f"ttm-control-plane prefix redirected to {location} — should be "
+            "public, not bounced to /login"
+        )
+
+
+def test_gated_other_plugin_prefix_stays_gated(gated_app):
+    """The exception is NARROW: only ttm-control-plane is exempt. Any other
+    plugin path must still hit the OAuth gate and 401 without a cookie, so
+    the prefix allowlist can't be used to expose arbitrary dashboard
+    plugins.
+    """
+    r = gated_app.get(
+        "/api/plugins/some-other-plugin/health", follow_redirects=False
+    )
+    assert r.status_code == 401, (
+        f"expected 401 for a non-exempt plugin path, got {r.status_code}: "
+        f"{r.text}"
+    )
+
+
 def test_gated_html_redirects_to_login(gated_app):
     r = gated_app.get("/", follow_redirects=False)
     assert r.status_code == 302
