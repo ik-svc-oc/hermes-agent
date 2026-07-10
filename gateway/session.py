@@ -1217,6 +1217,26 @@ class SessionStore:
     def _save_sessions_json(self, data: Dict[str, Any]) -> None:
         """Write the legacy sessions.json mirror of the routing index."""
         import tempfile
+
+        # Fail-CLOSED scrub of every routing entry before it hits this PLAINTEXT
+        # mirror. The state.db copy is scrubbed at the DB writer, but this file
+        # is written raw — a SessionEntry can carry a credentialed
+        # model_override.base_url, which would land cleartext here otherwise
+        # (G1). Scrub per-entry (structured, force) so a redactor fault
+        # placeholders only that entry while session keys + clean routing fields
+        # survive. If the redactor import itself is unavailable, withhold the
+        # whole mirror rather than write it raw — the durable state.db copy is
+        # the primary index, so a stale/absent mirror is the safe degradation.
+        try:
+            from agent.redact import scrub_structured_for_storage
+        except Exception:
+            logger.exception(
+                "gateway.session: sessions.json scrub unavailable; "
+                "withholding plaintext mirror (state.db copy is authoritative)"
+            )
+            return
+        data = {k: scrub_structured_for_storage(v) for k, v in data.items()}
+
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
         sessions_file = self.sessions_dir / "sessions.json"
 

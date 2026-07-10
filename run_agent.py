@@ -5993,7 +5993,14 @@ def main(
             "completed": result['completed'],
             "query": user_query
         }
-        
+
+        # Fail-closed scrub before this durable trajectory dump — it serializes
+        # the raw conversation (prompts + tool output) to a plaintext file and
+        # can carry secrets. scrub_structured_for_storage masks every string
+        # leaf (denylist + shape, force) and yields a placeholder on fault.
+        from agent.redact import scrub_structured_for_storage
+        entry = scrub_structured_for_storage(entry)
+
         try:
             with open(sample_filename, "w", encoding="utf-8") as f:
                 # Pretty-print JSON with indent for readability
