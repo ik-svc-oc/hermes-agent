@@ -347,3 +347,73 @@ class TestExportNoPartialFileOnFault:
         with pytest.raises(SystemExit):
             main_mod.main()
         assert not out.exists(), "partial/truncated export file left behind on scrub fault"
+
+
+# ── G1 ───────────────────────────────────────────────────────────────────────
+class TestSessionsJsonMirrorScrub:
+    def _store(self, tmp_path, monkeypatch):
+        import hermes_state as _hs
+        from gateway.session import SessionStore
+        from gateway.config import GatewayConfig
+
+        monkeypatch.setattr(_hs, "DEFAULT_DB_PATH", tmp_path / "state.db")
+        return SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+
+    def test_credentialed_base_url_masked_in_file_bytes(self, tmp_path, monkeypatch, seeded_denylist):
+        store = self._store(tmp_path, monkeypatch)
+        data = {
+            "agent:main:telegram:1": {
+                "session_id": "s1",
+                "session_key": "agent:main:telegram:1",
+                "model_override": {
+                    "model": "m", "provider": "p",
+                    "base_url": f"https://svc:{OPAQUE}@api.host.example/v1",
+                },
+            }
+        }
+        store._save_sessions_json(data)
+        raw = (tmp_path / "sessions.json").read_text(encoding="utf-8")
+        assert OPAQUE not in raw, "credentialed base_url written cleartext to sessions.json mirror"
+        # Clean routing data round-trips: the key and the clean host survive.
+        assert "agent:main:telegram:1" in raw
+        assert "api.host.example" in raw
+
+    def test_clean_base_url_round_trips(self, tmp_path, monkeypatch, seeded_denylist):
+        store = self._store(tmp_path, monkeypatch)
+        clean = "https://api.openrouter.ai/v1"
+        data = {"k": {"session_id": "s", "model_override": {"base_url": clean}}}
+        store._save_sessions_json(data)
+        raw = (tmp_path / "sessions.json").read_text(encoding="utf-8")
+        assert clean in raw, "a clean base_url must survive the scrub untouched"
+
+
+# ── G2 ───────────────────────────────────────────────────────────────────────
+class TestInventoryCatchesJsonFileWriters:
+    def _inv(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "inv_mod", str(__import__("pathlib").Path(__file__).with_name("test_scrub_boundary_inventory.py"))
+        )
+        m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(m)
+        return m
+
+    def test_sessions_json_dump_is_discovered_and_annotated(self):
+        m = self._inv()
+        disc = m._discover()
+        json_file = {fp: lbl for fp, lbl in disc.items() if lbl.startswith("JSON_FILE")}
+        # The round-3 hole: the sessions.json json.dump MUST now be found.
+        assert any("gateway/session.py" in lbl for lbl in json_file.values()), (
+            "scanner failed to discover the sessions.json json.dump writer"
+        )
+        # Every discovered file writer must be annotated.
+        for fp in json_file:
+            assert fp in m.ALLOWLIST, f"JSON_FILE site {json_file[fp]} not annotated"
+
+    def test_removing_a_json_file_entry_fails_inventory(self):
+        m = self._inv()
+        disc = m._discover()
+        victim = next(fp for fp, lbl in disc.items() if lbl.startswith("JSON_FILE"))
+        m.ALLOWLIST.pop(victim)
+        with pytest.raises(AssertionError, match="New durable persistence"):
+            m.test_every_durable_write_site_is_annotated()

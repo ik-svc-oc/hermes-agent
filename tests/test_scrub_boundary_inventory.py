@@ -61,6 +61,20 @@ _SQL_STMT_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
+# File-based durable JSON writers (G2) — the round-3 hole. Two shapes:
+#   * ``json.dump(obj, f)`` — the builtin ALWAYS serializes to a file object;
+#     ``json.dumps(`` (string form) is deliberately NOT matched here.
+#   * ``<fh>.write(... json.dumps(...) ...)`` / ``<path>.write_text(json.dumps(``
+#     where the receiver is a file-HANDLE-like name. The handle allowlist
+#     excludes HTTP/stream writers (``response.write`` / ``_stream_q.put``),
+#     which are transient wire emission, not an at-rest artifact.
+_JSON_DUMP_FILE_RE = re.compile(r"\bjson\.dump\s*\(")
+_JSON_DUMPS_TO_FILE_RE = re.compile(
+    r"(?:(?<![\w.])(?:f|fh|fp|fo|fd|out|outfile|handle|fileobj)\.write\("
+    r"|\.write_text\()"
+    r"[^\n]*?\bjson\.dumps\s*\("
+)
+
 
 def _fingerprint(s: str) -> str:
     return hashlib.sha256(re.sub(r"\s+", " ", s).strip().encode()).hexdigest()[:12]
@@ -83,6 +97,8 @@ def _scan_file(rel: str):
         mm = _STORE_PUT_RE.search(line)
         if mm:
             yield _fingerprint(line.strip()), f"STORE_PUT {rel}:{i} {mm.group(1)}.put"
+        if _JSON_DUMP_FILE_RE.search(line) or _JSON_DUMPS_TO_FILE_RE.search(line):
+            yield _fingerprint(line.strip()), f"JSON_FILE {rel}:{i} {line.strip()[:70]}"
 
 
 def _discover():
@@ -112,14 +128,23 @@ ALLOWLIST = {
     "18a5acdc62c9": "scrubbed",  # SQL hermes_state.py UPDATE sessions(display_name,origin_json) backfill — scrubs display_name+origin (F2)
     "53f48b3b4ecf": "scrubbed",  # SQL hermes_state.py INSERT gateway_routing.entry_json — save_gateway_routing_entry scrubs base_url creds (F1)
     "b1fd76428a19": "scrubbed",  # SQL hermes_state.py INSERT gateway_routing.entry_json bulk replace — replace_gateway_routing_entries scrubs (F1)
+    "93b965255a29": "scrubbed",  # JSON_FILE gateway/session.py sessions.json mirror — _save_sessions_json scrubs each entry before json.dump (G1)
+    "a7780f2e24bd": "scrubbed",  # JSON_FILE run_agent.py save_sample trajectory dump — scrub_structured_for_storage before write (G2b)
     # -- exempt (provably no operator secret; reason MUST say why) ------------
     "6e6b641b88ee": "exempt: FTS health-probe writes the constant literal '_fts_health_probe' inside a ROLLBACK",
-    "8879218d9472": "exempt: messages_fts shadow index mirrors already-scrubbed messages.content",
-    "635d0145660f": "exempt: messages_fts_trigram shadow index mirrors already-scrubbed messages.content",
-    "948c5232a4e7": "exempt: messages_fts rebuild mirrors already-scrubbed messages.content",
-    "940a4e828f9e": "exempt: messages_fts_trigram rebuild mirrors already-scrubbed messages.content",
+    # The messages_fts triggers index content||tool_name||tool_calls (hermes_state.py
+    # messages_fts_insert/_update): content is scrubbed at the messages INSERT
+    # (44f7e8809eab) and tool_calls is adjudicated-intact (persisted unscrubbed by
+    # design, same as the messages row). The FTS index therefore introduces NO
+    # plaintext beyond what the messages row already stores — it is a derived
+    # mirror, not an independent write surface.
+    "8879218d9472": "exempt: messages_fts shadow index mirrors the messages row's content(scrubbed)+tool_name+tool_calls(adjudicated-intact); no new plaintext beyond the messages row",
+    "635d0145660f": "exempt: messages_fts_trigram shadow index mirrors content(scrubbed)+tool_name+tool_calls(adjudicated-intact); no new plaintext beyond the messages row",
+    "948c5232a4e7": "exempt: messages_fts rebuild mirrors content(scrubbed)+tool_name+tool_calls(adjudicated-intact); no new plaintext beyond the messages row",
+    "940a4e828f9e": "exempt: messages_fts_trigram rebuild mirrors content(scrubbed)+tool_name+tool_calls(adjudicated-intact); no new plaintext beyond the messages row",
     "e4741b4f9f95": "exempt: json_set writes a lineage marker (_delegate_from/_branched_from), never user text",
     "f15e2d533ec0": "exempt: sets system_prompt = NULL (clears the cached snapshot), writes no value",
+    "ae5a40c4dd14": "exempt: manifest.jsonl holds export METADATA only (session_id, lineage ids, path, format, message_count, sha256, timestamp) — no transcript or tool content",
 }
 
 
