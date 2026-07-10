@@ -13835,9 +13835,18 @@ def main():
             def _redact(data):
                 if not args.redact or data is None:
                     return data
-                from hermes_cli.session_export_md import redact_session_data
+                from hermes_cli.session_export_md import (
+                    ExportRedactionError,
+                    redact_session_data,
+                )
 
-                return redact_session_data(data)
+                try:
+                    return redact_session_data(data)
+                except ExportRedactionError as exc:
+                    # Fail-closed: a redactor fault must abort the whole export,
+                    # never fall through to writing an unredacted file.
+                    print(f"Error: {exc}")
+                    raise SystemExit(1) from exc
 
             def _collect_sessions():
                 """Resolve --session-id / filters / bare export into a list

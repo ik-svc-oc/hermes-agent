@@ -216,26 +216,37 @@ def verify_export_file(path: Path | str, session: dict[str, Any]) -> tuple[bool,
     return True, "ok"
 
 
+class ExportRedactionError(RuntimeError):
+    """Raised when the ``--redact`` scrub faults — the export is refused."""
+
+
 def redact_session_data(session: dict[str, Any]) -> dict[str, Any]:
     """Return a deep copy of a session export dict with secrets redacted.
 
     Runs every message's content and tool-call arguments through the
-    force-mode redaction pass (``agent.redact.redact_sensitive_text``), so
-    API keys, tokens, and credentials that appeared in tool output never
-    land in plaintext export files. Force mode ignores the user's global
+    STORAGE-grade recursive scrub (``agent.redact.redact_structured_for_storage``,
+    ``force=True``): the env-VALUE denylist runs first so opaque operator
+    secrets (tokens with no vendor shape) are caught by exact value, then every
+    shape pattern. This is strictly stronger than the old
+    ``redact_sensitive_text`` pass, which applied shape patterns only and let
+    opaque secrets through. Force mode ignores the user's global
     ``security.redact_secrets`` preference — an explicit ``--redact`` export
     must never emit raw secrets.
+
+    Fail-CLOSED: if the redactor faults on any field, the export is REFUSED
+    (``ExportRedactionError``) rather than writing a file that could contain an
+    unredacted secret. The caller writes the file only after this returns.
     """
-    from agent.redact import redact_sensitive_text
+    from agent import redact as _redact
 
     def _clean(value: Any) -> Any:
-        if isinstance(value, str):
-            return redact_sensitive_text(value, force=True)
-        if isinstance(value, list):
-            return [_clean(v) for v in value]
-        if isinstance(value, dict):
-            return {k: _clean(v) for k, v in value.items()}
-        return value
+        try:
+            return _redact.redact_structured_for_storage(value, force=True)
+        except Exception as exc:  # noqa: BLE001 — any fault must refuse, not leak
+            raise ExportRedactionError(
+                "Refusing --redact export: secret redaction failed "
+                f"({type(exc).__name__}: {exc}). No file was written."
+            ) from exc
 
     redacted = dict(session)
     for key in ("messages", "segments"):

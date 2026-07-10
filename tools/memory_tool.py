@@ -244,18 +244,28 @@ class MemoryStore:
                 continue
             # Scrub credentials from the snapshot copy that gets injected into
             # the system prompt (and re-emitted). Forced + fail-closed: on a
-            # redactor fault the entry is withheld rather than injected raw.
-            # Live state keeps the original so the user can still inspect +
-            # remove it via the tool.
-            if scrub_text_for_storage is not None:
-                try:
-                    entry = scrub_text_for_storage(entry)
-                except Exception:
-                    logger.exception(
-                        "Memory snapshot redaction faulted for %s; withholding entry",
-                        filename,
-                    )
-                    entry = "[REDACTION-ERROR: memory entry withheld from system prompt]"
+            # redactor fault — INCLUDING the import above failing — the entry is
+            # withheld rather than injected raw. Live state keeps the original
+            # so the user can still inspect + remove it via the tool.
+            if scrub_text_for_storage is None:
+                # Import of the redactor failed. A missing scrubber is a scrub
+                # fault, not a licence to inject raw: withhold (fail CLOSED).
+                logger.error(
+                    "Memory snapshot redactor unavailable (import failed) for %s; "
+                    "withholding entry", filename,
+                )
+                sanitized.append(
+                    "[REDACTION-ERROR: memory entry withheld from system prompt]"
+                )
+                continue
+            try:
+                entry = scrub_text_for_storage(entry)
+            except Exception:
+                logger.exception(
+                    "Memory snapshot redaction faulted for %s; withholding entry",
+                    filename,
+                )
+                entry = "[REDACTION-ERROR: memory entry withheld from system prompt]"
             sanitized.append(entry)
         return sanitized
 

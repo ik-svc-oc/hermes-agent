@@ -60,7 +60,7 @@ from gateway.platforms.base import (
     is_network_accessible,
     validate_media_delivery_path,
 )
-from agent.redact import redact_sensitive_text
+from agent.redact import redact_sensitive_text, scrub_structured_for_storage
 
 logger = logging.getLogger(__name__)
 
@@ -456,7 +456,7 @@ class ResponseStore:
         )
         self._conn.commit()
         try:
-            return json.loads(row[0])
+            parsed = json.loads(row[0])
         except (json.JSONDecodeError, TypeError):
             logger.warning(
                 "Corrupted JSON in response store for id=%s, evicting entry",
@@ -468,12 +468,24 @@ class ResponseStore:
             )
             self._conn.commit()
             return None
+        # Scrub on re-emission too (fail-closed): rows written before the
+        # put()-side scrub existed may still hold raw secrets, and this read
+        # path re-emits them to API clients. Idempotent for already-scrubbed
+        # rows (masked values no longer match).
+        return scrub_structured_for_storage(parsed)
 
     def put(self, response_id: str, data: Dict[str, Any]) -> None:
         """Store a response, evicting the oldest if at capacity."""
+        # Fail-closed scrub before persistence: ``data`` is the full
+        # /v1/responses payload (input prompts, tool output, conversation
+        # history) and ``store`` defaults to True, so an unscrubbed secret in
+        # model/tool output would land in response_store.db verbatim. Walk every
+        # string leaf (env-value denylist + shape patterns, force) and yield a
+        # placeholder on redactor fault rather than the raw value.
+        scrubbed = scrub_structured_for_storage(data)
         self._conn.execute(
             "INSERT OR REPLACE INTO responses (response_id, data, accessed_at) VALUES (?, ?, ?)",
-            (response_id, json.dumps(data, default=str), time.time()),
+            (response_id, json.dumps(scrubbed, default=str), time.time()),
         )
         # Evict oldest entries beyond max_size
         count = self._conn.execute("SELECT COUNT(*) FROM responses").fetchone()[0]
