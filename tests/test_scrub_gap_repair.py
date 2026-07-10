@@ -237,3 +237,113 @@ class TestExportRedactRefusesOnFault:
             {"messages": [{"role": "assistant", "content": f"key {OPAQUE}"}]}
         )
         assert OPAQUE not in json.dumps(out)
+
+
+# ── F1 ───────────────────────────────────────────────────────────────────────
+class TestGatewayRoutingEntryJsonScrub:
+    def _routing_rows(self, db_path):
+        conn = sqlite3.connect(str(db_path))
+        try:
+            return [r[0] for r in conn.execute("SELECT entry_json FROM gateway_routing").fetchall()]
+        finally:
+            conn.close()
+
+    def test_save_masks_credentialed_base_url(self, db, seeded_denylist):
+        # base_url with an opaque credential in userinfo — the DB-only DSN shape
+        # pattern does NOT catch https userinfo, so this proves the denylist
+        # (non-URL-shaped) catch the flip relies on.
+        entry = json.dumps({
+            "session_key": "sk-routing-1",
+            "model_override": {
+                "model": "m", "provider": "p",
+                "base_url": f"https://svc:{OPAQUE}@api.provider.example/v1",
+            },
+        })
+        db.save_gateway_routing_entry("sk-routing-1", entry, scope="s")
+        stored = self._routing_rows(db._db_path_for_test)[0]
+        assert OPAQUE not in stored, "credentialed base_url persisted raw in entry_json"
+        # Routing structure + clean host survive.
+        assert "sk-routing-1" in stored and "api.provider.example" in stored
+
+    def test_replace_masks_shape_secret_in_base_url(self, db, seeded_denylist):
+        entry = json.dumps({
+            "session_key": "sk2",
+            "model_override": {"base_url": f"https://{GHP}@api.host/v1"},
+        })
+        db.replace_gateway_routing_entries({"sk2": entry}, scope="s")
+        stored = self._routing_rows(db._db_path_for_test)[0]
+        assert GHP not in stored, "shape secret in base_url persisted raw"
+        assert "api.host" in stored
+
+
+# ── F2 ───────────────────────────────────────────────────────────────────────
+class TestGatewayPeerMetadataScrub:
+    def _peer_row(self, db_path, session_id):
+        conn = sqlite3.connect(str(db_path))
+        try:
+            return conn.execute(
+                "SELECT display_name, origin_json, chat_id FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+
+    def test_display_name_and_origin_masked_routing_ids_preserved(self, db, seeded_denylist):
+        db.create_session(session_id="p1", source="telegram")
+        db.record_gateway_session_peer(
+            "p1",
+            source="telegram",
+            session_key="skp1",
+            chat_id="123456789",
+            display_name=f"user {OPAQUE}",
+            origin_json=json.dumps({"chat_id": "123456789", "note": f"tok {OPAQUE}"}),
+        )
+        display_name, origin_json, chat_id = self._peer_row(db._db_path_for_test, "p1")
+        assert OPAQUE not in (display_name or ""), "secret leaked into display_name"
+        assert OPAQUE not in (origin_json or ""), "secret leaked into origin_json"
+        # Routing IDs are preserved (not secret-shaped).
+        assert chat_id == "123456789"
+        assert "123456789" in (origin_json or "")
+
+
+# ── F3 ───────────────────────────────────────────────────────────────────────
+class TestExportNoPartialFileOnFault:
+    def test_multi_session_jsonl_fault_leaves_no_partial_file(self, tmp_path, monkeypatch):
+        import sys
+        import hermes_cli.main as main_mod
+        import hermes_state
+        from hermes_cli.session_export_md import ExportRedactionError
+
+        out = tmp_path / "export.jsonl"
+
+        class FakeDB:
+            def export_all(self, source=None):
+                return [
+                    {"id": "s1", "messages": [{"role": "user", "content": "one"}]},
+                    {"id": "s2", "messages": [{"role": "user", "content": "two"}]},
+                ]
+
+            def close(self):
+                pass
+
+        # Redactor faults on the SECOND session — under the old code the dest was
+        # opened (truncated) and s1 already written before this raised, leaving a
+        # partial file. The fix redacts all sessions before opening the dest.
+        calls = {"n": 0}
+
+        def _boom_on_second(obj, *a, **k):
+            calls["n"] += 1
+            if calls["n"] >= 2:
+                raise RuntimeError("redactor down")
+            return obj
+
+        monkeypatch.setattr(redact, "redact_structured_for_storage", _boom_on_second)
+        monkeypatch.setattr(hermes_state, "SessionDB", lambda: FakeDB())
+        monkeypatch.setattr(
+            sys, "argv",
+            ["hermes", "sessions", "export", "--format", "jsonl", "--redact", str(out)],
+        )
+        # redact_session_data raises ExportRedactionError → _redact prints + SystemExit(1).
+        with pytest.raises(SystemExit):
+            main_mod.main()
+        assert not out.exists(), "partial/truncated export file left behind on scrub fault"

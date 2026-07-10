@@ -36,6 +36,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DOCUMENTED_MODULES = (
     "hermes_state.py",
     "gateway/platforms/api_server.py",
+    "gateway/session.py",  # serializes the routing data (model_override.base_url,
+                           # display_name, origin) persisted via hermes_state's
+                           # gateway_routing/sessions writers; scanned so a direct
+                           # durable writer added here can't bypass the inventory.
     "run_agent.py",
     "hermes_cli/session_export_md.py",
     "tools/memory_tool.py",
@@ -104,7 +108,11 @@ ALLOWLIST = {
     "44f7e8809eab": "scrubbed",  # SQL hermes_state.py INSERT messages(content,reasoning,*_items) — _scrub_record_for_storage
     "dee043f3bae5": "scrubbed",  # SQL api_server.py INSERT responses.data — ResponseStore.put scrubs (R2)
     "6cefe6ad95a5": "scrubbed",  # STORE_PUT api_server.py _response_store.put — put() scrubs the payload (R2)
-    # -- exempt (provably no operator secret) --------------------------------
+    "696330e946a6": "scrubbed",  # SQL hermes_state.py UPDATE sessions(display_name,origin_json) — record_gateway_session_peer scrubs (F2)
+    "18a5acdc62c9": "scrubbed",  # SQL hermes_state.py UPDATE sessions(display_name,origin_json) backfill — scrubs display_name+origin (F2)
+    "53f48b3b4ecf": "scrubbed",  # SQL hermes_state.py INSERT gateway_routing.entry_json — save_gateway_routing_entry scrubs base_url creds (F1)
+    "b1fd76428a19": "scrubbed",  # SQL hermes_state.py INSERT gateway_routing.entry_json bulk replace — replace_gateway_routing_entries scrubs (F1)
+    # -- exempt (provably no operator secret; reason MUST say why) ------------
     "6e6b641b88ee": "exempt: FTS health-probe writes the constant literal '_fts_health_probe' inside a ROLLBACK",
     "8879218d9472": "exempt: messages_fts shadow index mirrors already-scrubbed messages.content",
     "635d0145660f": "exempt: messages_fts_trigram shadow index mirrors already-scrubbed messages.content",
@@ -112,15 +120,20 @@ ALLOWLIST = {
     "940a4e828f9e": "exempt: messages_fts_trigram rebuild mirrors already-scrubbed messages.content",
     "e4741b4f9f95": "exempt: json_set writes a lineage marker (_delegate_from/_branched_from), never user text",
     "f15e2d533ec0": "exempt: sets system_prompt = NULL (clears the cached snapshot), writes no value",
-    "696330e946a6": "exempt: gateway routing peer metadata (display_name/origin_json) — platform-provided routing identifiers, not credentials",
-    "18a5acdc62c9": "exempt: gateway routing peer metadata (display_name/origin_json) — platform-provided routing identifiers, not credentials",
-    "53f48b3b4ecf": "exempt: gateway_routing.entry_json is the serialized SessionEntry routing index — platform metadata, not credentials",
-    "b1fd76428a19": "exempt: gateway_routing.entry_json bulk replace — serialized SessionEntry routing index, not credentials",
 }
 
 
+_MIN_EXEMPT_REASON_CHARS = 12
+
+
 def _valid_disposition(value: str) -> bool:
-    return value == "scrubbed" or value.startswith("exempt:")
+    if value == "scrubbed":
+        return True
+    if value.startswith("exempt:"):
+        # Reason-discipline: an exempt entry MUST cite why it is provably
+        # non-secret. A bare "exempt:" (or a token gesture) is not a decision.
+        return len(value[len("exempt:"):].strip()) >= _MIN_EXEMPT_REASON_CHARS
+    return False
 
 
 def test_every_durable_write_site_is_annotated():
@@ -146,6 +159,7 @@ def test_every_durable_write_site_is_annotated():
 
     bad = {fp: v for fp, v in ALLOWLIST.items() if not _valid_disposition(v)}
     assert not bad, (
-        'Every ALLOWLIST disposition must be "scrubbed" or start with '
-        f'"exempt:". Malformed entries: {bad}'
+        'Every ALLOWLIST disposition must be "scrubbed" or "exempt: <reason>" '
+        "where the reason states why the site provably cannot carry an operator "
+        f"secret (>= {_MIN_EXEMPT_REASON_CHARS} chars). Malformed entries: {bad}"
     )
