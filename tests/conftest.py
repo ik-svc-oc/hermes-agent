@@ -325,6 +325,52 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
 })
 
 
+# Module-level HERMES_HOME-derived path constants that several modules snapshot
+# at import time. When such a module is first imported while the real
+# ``~/.hermes`` is active (pytest collection, or a predecessor test in the same
+# in-process run), the constant freezes to the real home — and later
+# ``SessionDB()`` / session reads leak the real ``state.db`` / ``sessions.json``
+# into an otherwise-hermetic test. ``_repoint_home_anchored_paths`` re-derives
+# them from the per-test home so cross-file ordering can't poison them.
+#
+# Each entry is (module_name, ((attr, home_relative_parts), ...)).
+_HOME_ANCHORED_MODULE_PATHS = (
+    ("hermes_state", (("DEFAULT_DB_PATH", ("state.db",)),)),
+    (
+        "gateway.mirror",
+        (
+            ("_SESSIONS_DIR", ("sessions",)),
+            ("_SESSIONS_INDEX", ("sessions", "sessions.json")),
+        ),
+    ),
+    (
+        "gateway.channel_directory",
+        (
+            ("DIRECTORY_PATH", ("channel_directory.json",)),
+            ("CHANNEL_ALIASES_PATH", ("channel_aliases.json",)),
+        ),
+    ),
+)
+
+
+def _repoint_home_anchored_paths(monkeypatch, home: Path) -> None:
+    """Re-point already-imported modules' frozen HERMES_HOME-derived path
+    constants at *home*.
+
+    Only modules already present in ``sys.modules`` are touched (this never
+    forces an import). Uses ``monkeypatch`` so the original value is restored
+    after the test, and a more-local fixture/test body that sets one of these
+    constants to a specific path still wins — it runs after this autouse step.
+    """
+    for mod_name, attrs in _HOME_ANCHORED_MODULE_PATHS:
+        mod = sys.modules.get(mod_name)
+        if mod is None:
+            continue
+        for attr, parts in attrs:
+            if hasattr(mod, attr):
+                monkeypatch.setattr(mod, attr, home.joinpath(*parts), raising=False)
+
+
 @pytest.fixture(autouse=True)
 def _hermetic_environment(tmp_path, monkeypatch):
     """Blank out all credential/behavioral env vars so local and CI match.
@@ -359,6 +405,14 @@ def _hermetic_environment(tmp_path, monkeypatch):
     (fake_hermes_home / "memories").mkdir()
     (fake_hermes_home / "skills").mkdir()
     monkeypatch.setenv("HERMES_HOME", str(fake_hermes_home))
+
+    # 3b. Re-point module-level HERMES_HOME-derived path constants (e.g.
+    #     hermes_state.DEFAULT_DB_PATH, the gateway mirror / channel_directory
+    #     session paths) at the per-test home. These are snapshotted at import
+    #     time, so a module first imported while the real ~/.hermes was active
+    #     otherwise keeps reading the real state.db / sessions.json regardless
+    #     of this HERMES_HOME redirect. See _repoint_home_anchored_paths.
+    _repoint_home_anchored_paths(monkeypatch, fake_hermes_home)
 
     # 4. Deterministic locale / timezone / hashseed. CI runs in UTC with
     #    C.UTF-8 locale; local dev often doesn't. Pin everything.
