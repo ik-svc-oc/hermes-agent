@@ -359,7 +359,19 @@ class TestSessionsJsonMirrorScrub:
         monkeypatch.setattr(_hs, "DEFAULT_DB_PATH", tmp_path / "state.db")
         return SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
 
-    def test_credentialed_base_url_masked_in_file_bytes(self, tmp_path, monkeypatch, seeded_denylist):
+    def test_denylisted_and_shape_credentials_masked_in_sessions_json(self, tmp_path, monkeypatch, seeded_denylist):
+        """A denylisted (or known-shape) credential inside a
+        ``model_override.base_url`` is masked before the sessions.json mirror is
+        written.
+
+        Scope note: this asserts the denylisted/shape case only — here OPAQUE is
+        seeded onto the env-value denylist, so it is masked by exact-value match,
+        NOT because the ``user:pass@`` userinfo shape is redacted. The generic
+        web-scheme ``user:pass@`` form with an arbitrary (non-denylisted,
+        non-shape) password is an ACCEPTED, un-masked residual — see the
+        PERSISTENCE POLICY note in ``agent/redact.redact_sensitive_text`` and the
+        narrowed comment in ``gateway/session._save_sessions_json``.
+        """
         store = self._store(tmp_path, monkeypatch)
         data = {
             "agent:main:telegram:1": {

@@ -673,6 +673,19 @@ def redact_sensitive_text(
     # userinfo is never a round-trip workflow token (those live in the query
     # string), so masking it can't break a skill. The ``user:pass@`` form is
     # left to pass through per #34029.
+    #
+    # PERSISTENCE POLICY (accepted residual): because the web-scheme
+    # ``user:pass@`` userinfo form is not masked here — nor by the structured
+    # storage scrub — a credentialed ``model_override.base_url`` can reach the
+    # persisted sessions.json / state.db mirrors verbatim. This is accepted, not
+    # a redactor bug: skills must be able to follow magic-link / OAuth-callback /
+    # pre-signed URLs (#34029, #6396, #33801), so blanket userinfo masking is off
+    # by design. Real credentials belong in the ``api_key`` field — which is
+    # dropped before persistence — not in ``base_url``. The residual is IDENTICAL
+    # in state.db and sessions.json (parity), so neither mirror is more exposed
+    # than the other. Denylisted values and known shapes embedded in such a URL
+    # ARE still masked (env-value denylist + _PREFIX_RE + _JWT_RE +
+    # _URL_BARE_TOKEN_RE).
 
     # Form-urlencoded bodies (only triggers on clean k=v&k=v inputs).
     if "&" in text and "=" in text:

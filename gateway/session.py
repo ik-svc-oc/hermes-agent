@@ -1219,14 +1219,21 @@ class SessionStore:
         import tempfile
 
         # Fail-CLOSED scrub of every routing entry before it hits this PLAINTEXT
-        # mirror. The state.db copy is scrubbed at the DB writer, but this file
-        # is written raw — a SessionEntry can carry a credentialed
-        # model_override.base_url, which would land cleartext here otherwise
-        # (G1). Scrub per-entry (structured, force) so a redactor fault
-        # placeholders only that entry while session keys + clean routing fields
-        # survive. If the redactor import itself is unavailable, withhold the
-        # whole mirror rather than write it raw — the durable state.db copy is
-        # the primary index, so a stale/absent mirror is the safe degradation.
+        # mirror. The state.db copy is scrubbed at the DB writer; this file is
+        # written raw, so a SessionEntry carrying a credentialed
+        # model_override.base_url would otherwise land cleartext here (G1). The
+        # scrub masks denylisted values and known credential shapes (sk-/ghp_,
+        # JWTs, DB-connstr passwords, colon-less bare-token userinfo) — it does
+        # NOT mask the web-scheme ``user:pass@`` userinfo form, which is an
+        # accepted, un-masked residual (skills must follow magic-link / OAuth /
+        # pre-signed URLs; see the PERSISTENCE POLICY note in
+        # agent/redact.redact_sensitive_text). That residual is identical in the
+        # state.db mirror (parity). Scrub per-entry (structured, force) so a
+        # redactor fault placeholders only that entry while session keys + clean
+        # routing fields survive. If the redactor import itself is unavailable,
+        # withhold the whole mirror rather than write it raw — the durable
+        # state.db copy is the primary index, so a stale/absent mirror is the
+        # safe degradation.
         try:
             from agent.redact import scrub_structured_for_storage
         except Exception:
