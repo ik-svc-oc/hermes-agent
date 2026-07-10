@@ -161,6 +161,36 @@ def _scrub_structured_for_storage(obj):
         return "[REDACTION-ERROR]"
 
 
+def _scrub_json_string_for_storage(value):
+    """Fail-CLOSED structured scrub of a JSON-STRING column bound for persistence.
+
+    Used for the gateway-routing ``entry_json`` / ``origin_json`` blobs — a
+    serialized ``SessionEntry`` / origin dict that can carry a credentialed
+    ``base_url`` (userinfo or query secret) or other secret-shaped leaves. Parses
+    the JSON, scrubs every string leaf structurally (env-value denylist + shape,
+    force), then re-serializes so non-secret routing IDs (session_key, chat_id,
+    a clean base_url) survive untouched while embedded secrets are masked. Falls
+    back to a plain-text scrub when the value isn't parseable JSON, and to a
+    placeholder on any redactor fault.
+    """
+    if value is None:
+        return None
+    try:
+        from agent.redact import scrub_structured_for_storage
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+            except (TypeError, ValueError):
+                # Not JSON after all — scrub as opaque text rather than trust it.
+                return _redact_persisted_text(value)
+            return json.dumps(scrub_structured_for_storage(parsed))
+        # Already-structured input: scrub and re-serialize.
+        return json.dumps(scrub_structured_for_storage(value))
+    except Exception:
+        logger.exception("json-string redaction unavailable; failing closed")
+        return "[REDACTION-ERROR]"
+
+
 def _scrub_record_for_storage(record: Dict[str, Any]) -> Dict[str, Any]:
     """Fail-CLOSED scrub of a message record (content + reasoning + serialized
     reasoning/codex payloads) via the shared record scrubber."""
@@ -1805,6 +1835,14 @@ class SessionDB:
         if not session_id or not session_key:
             return
 
+        # Fail-closed scrub before persistence — display_name and origin_json are
+        # user-controlled (from SessionSource.to_dict) and could carry a pasted
+        # secret. Structured/text scrub masks secret-shaped leaves while leaving
+        # routing IDs (session_key/chat_id/thread_id) intact. None passes through
+        # so the COALESCE "leave existing" semantics are preserved.
+        display_name = _redact_persisted_text(display_name)
+        origin_json = _scrub_json_string_for_storage(origin_json)
+
         def _do(conn):
             conn.execute(
                 """UPDATE sessions
@@ -1863,6 +1901,10 @@ class SessionDB:
         if not session_key or not entry_json:
             return
 
+        # Fail-closed scrub before persistence — the serialized SessionEntry can
+        # carry a credentialed model_override.base_url (userinfo/query secret).
+        entry_json = _scrub_json_string_for_storage(entry_json)
+
         def _do(conn):
             conn.execute(
                 """INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at)
@@ -1886,14 +1928,21 @@ class SessionDB:
         untouched.
         """
         now = time.time()
+        # Fail-closed scrub of every entry_json before persistence — a serialized
+        # SessionEntry can carry a credentialed model_override.base_url.
+        scrubbed = {
+            k: _scrub_json_string_for_storage(v)
+            for k, v in entries.items()
+            if k and v
+        }
 
         def _do(conn):
             conn.execute("DELETE FROM gateway_routing WHERE scope = ?", (scope,))
-            if entries:
+            if scrubbed:
                 conn.executemany(
                     "INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at) "
                     "VALUES (?, ?, ?, ?)",
-                    [(scope, k, v, now) for k, v in entries.items() if k and v],
+                    [(scope, k, v, now) for k, v in scrubbed.items()],
                 )
 
         self._execute_write(_do)
@@ -2052,8 +2101,11 @@ class SessionDB:
                     (origin or {}).get("chat_id") if isinstance(origin, dict) else None,
                     entry.get("chat_type"),
                     (origin or {}).get("thread_id") if isinstance(origin, dict) else None,
-                    entry.get("display_name"),
-                    json.dumps(origin) if isinstance(origin, dict) else None,
+                    # Fail-closed scrub of the user-controlled display_name/origin
+                    # copied out of legacy sessions.json (same boundary as the
+                    # live record_gateway_session_peer write).
+                    _redact_persisted_text(entry.get("display_name")),
+                    _scrub_json_string_for_storage(origin) if isinstance(origin, dict) else None,
                     1 if entry.get("expiry_finalized") or entry.get("memory_flushed") else 0,
                     str(session_id),
                 ),
