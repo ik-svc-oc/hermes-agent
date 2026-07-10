@@ -14103,18 +14103,22 @@ def main():
                             print("--dry-run requires at least one filter.")
                             return
                         sessions = db.export_all(source=None)
+                    # Redact every session UP FRONT, before opening the
+                    # destination. _redact can abort (SystemExit) on a scrub
+                    # fault, and open(..., "w") truncates on entry — redacting
+                    # inside the write loop would leave a truncated/partial
+                    # export artifact on fault. Building all lines first means a
+                    # fault aborts before anything is emitted or truncated (F3).
+                    lines = [
+                        _json.dumps(_redact(s), ensure_ascii=False) + "\n"
+                        for s in sessions
+                    ]
                     if args.output == "-":
-
-                        for s in sessions:
-                            sys.stdout.write(
-                                _json.dumps(_redact(s), ensure_ascii=False) + "\n"
-                            )
+                        for line in lines:
+                            sys.stdout.write(line)
                     else:
                         with open(args.output, "w", encoding="utf-8") as f:
-                            for s in sessions:
-                                f.write(
-                                    _json.dumps(_redact(s), ensure_ascii=False) + "\n"
-                                )
+                            f.writelines(lines)
                         print(f"Exported {len(sessions)} sessions to {args.output}")
                 return
 
