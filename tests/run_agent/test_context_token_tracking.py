@@ -59,7 +59,14 @@ def _make_agent(monkeypatch, api_mode, provider, response_fn):
             self._disable_streaming = True
             return super().run_conversation(msg, conversation_history=conversation_history, task_id=task_id)
 
-    return _A(model="test-model", api_key="test-key", base_url="http://localhost:1234/v1", provider=provider, api_mode=api_mode)
+    if provider == "anthropic":
+        # Exercise the Anthropic wire-shape and usage accounting without
+        # pretending a native/API-key Claude endpoint is still allowed.
+        provider = "custom"
+        base_url = "http://127.0.0.1:4100/anthropic"
+    else:
+        base_url = "http://localhost:1234/v1"
+    return _A(model="test-model", api_key="test-key", base_url=base_url, provider=provider, api_mode=api_mode)
 
 
 def _anthropic_resp(input_tok, output_tok, cache_read=0, cache_creation=0):

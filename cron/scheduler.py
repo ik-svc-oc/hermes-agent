@@ -2903,6 +2903,7 @@ def run_job(
             resolve_runtime_provider,
             format_runtime_provider_error,
         )
+        from hermes_cli.claude_route_policy import ClaudeRouteError
         from hermes_cli.auth import AuthError
 
         # F8 runtime backstop: never resolve a stored provider/base_url pair that
@@ -2922,9 +2923,15 @@ def run_job(
             runtime_kwargs = {
                 "requested": job.get("provider"),
             }
+            if job.get("model"):
+                runtime_kwargs["target_model"] = job.get("model")
             if job.get("base_url"):
                 runtime_kwargs["explicit_base_url"] = job.get("base_url")
             runtime = resolve_runtime_provider(**runtime_kwargs)
+        except ClaudeRouteError:
+            # Claude is pinned to the OAuth mini-proxy; do not turn a route
+            # outage or policy failure into a paid/API-key fallback job.
+            raise
         except AuthError as auth_exc:
             # Primary provider auth failed — try fallback chain before giving up.
             logger.warning("Job '%s': primary auth failed (%s), trying fallback", job_id, auth_exc)
@@ -2933,6 +2940,8 @@ def run_job(
             for entry in fb_list:
                 try:
                     fb_kwargs = {"requested": entry.get("provider")}
+                    if entry.get("model"):
+                        fb_kwargs["target_model"] = entry.get("model")
                     if entry.get("base_url"):
                         fb_kwargs["explicit_base_url"] = entry["base_url"]
                     if entry.get("api_key"):

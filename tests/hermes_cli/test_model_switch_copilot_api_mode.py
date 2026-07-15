@@ -1,10 +1,8 @@
-"""Regression tests for Copilot api_mode recomputation during /model switch.
+"""Regression tests for Claude route locking during /model switch.
 
-When switching models within the Copilot provider (e.g. GPT-5 → Claude),
-the stale api_mode from resolve_runtime_provider must be overridden with
-a fresh value computed from the *new* model.  Without the fix, Claude
-requests went through the Responses API and failed with
-``unsupported_api_for_model``.
+Claude selections are hard-locked to the OAuth mini-proxy regardless of the
+provider selected in the model menu.  The switch must not leave a stale
+Copilot Responses route behind.
 """
 
 from unittest.mock import patch
@@ -28,16 +26,26 @@ def _run_copilot_switch(
     runtime_api_mode: str = "codex_responses",
 ):
     """Run switch_model with Copilot mocks and return the result."""
+    def _runtime(**kwargs):
+        if kwargs.get("requested") == "claude-proxy":
+            return {
+                "api_key": "test-claude-proxy-token",
+                "base_url": "http://127.0.0.1:4100/v1",
+                "api_mode": "chat_completions",
+                "model": kwargs.get("target_model"),
+            }
+        return {
+            "api_key": "ghu_test_token",
+            "base_url": "https://api.githubcopilot.com",
+            "api_mode": runtime_api_mode,
+        }
+
     with (
         patch("hermes_cli.model_switch.resolve_alias", return_value=None),
         patch("hermes_cli.model_switch.list_provider_models", return_value=[]),
         patch(
             "hermes_cli.runtime_provider.resolve_runtime_provider",
-            return_value={
-                "api_key": "ghu_test_token",
-                "base_url": "https://api.githubcopilot.com",
-                "api_mode": runtime_api_mode,
-            },
+            side_effect=_runtime,
         ),
         patch(
             "hermes_cli.models.validate_requested_model",
@@ -65,7 +73,7 @@ def test_same_provider_copilot_switch_recomputes_api_mode():
 
     assert result.success, f"switch_model failed: {result.error_message}"
     assert result.new_model == "claude-opus-4.6"
-    assert result.target_provider == "copilot"
+    assert result.target_provider == "claude-proxy"
     assert result.api_mode == "chat_completions"
 
 
@@ -80,7 +88,7 @@ def test_explicit_copilot_switch_uses_selected_model_api_mode():
 
     assert result.success, f"switch_model failed: {result.error_message}"
     assert result.new_model == "claude-opus-4.6"
-    assert result.target_provider == "github-copilot"
+    assert result.target_provider == "claude-proxy"
     assert result.api_mode == "chat_completions"
 
 

@@ -1063,15 +1063,17 @@ class TestExplicitProviderRouting:
     """Test explicit provider selection bypasses auto chain correctly."""
 
     def test_explicit_anthropic_api_key(self, monkeypatch):
-        """provider='anthropic' + regular API key should work with is_oauth=False."""
+        """An explicit Anthropic API key cannot bypass the OAuth proxy."""
         with patch("agent.anthropic_adapter.resolve_anthropic_token", return_value="sk-ant-api-regular-key"), \
              patch("agent.anthropic_adapter.build_anthropic_client") as mock_build, \
              patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)):
             mock_build.return_value = MagicMock()
             client, model = resolve_provider_client("anthropic")
-            assert client is not None
-            adapter = client.chat.completions
-            assert adapter._is_oauth is False
+            from openai import OpenAI
+            assert isinstance(client, OpenAI)
+            assert str(client.base_url).rstrip("/") == "http://127.0.0.1:4100/v1"
+            assert client.api_key == "test-claude-proxy-token"
+            mock_build.assert_not_called()
 
     def test_explicit_openrouter_pool_exhausted_logs_precise_warning(self, monkeypatch, caplog):
         monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
@@ -1203,7 +1205,7 @@ class TestVisionClientFallback:
 
         assert "anthropic" in backends
 
-    def test_resolve_provider_client_returns_native_anthropic_wrapper(self, monkeypatch):
+    def test_resolve_provider_client_returns_oauth_proxy_client(self, monkeypatch):
         monkeypatch.setenv("ANTHROPIC_API_KEY", "***")
         with (
             patch("agent.auxiliary_client._read_nous_auth", return_value=None),
@@ -1213,7 +1215,10 @@ class TestVisionClientFallback:
             client, model = resolve_provider_client("anthropic")
 
         assert client is not None
-        assert client.__class__.__name__ == "AnthropicAuxiliaryClient"
+        from openai import OpenAI
+        assert isinstance(client, OpenAI)
+        assert str(client.base_url).rstrip("/") == "http://127.0.0.1:4100/v1"
+        assert client.api_key == "test-claude-proxy-token"
         assert model == "claude-haiku-4-5-20251001"
 
     def test_anthropic_auxiliary_client_aggregates_stream_response(self):
@@ -4869,8 +4874,8 @@ class TestAnthropicExplicitApiKey:
         assert client is not None
         assert mock_build.call_args.args[0] == "env-fallback-key"
 
-    def test_resolve_provider_client_passes_explicit_api_key_to_anthropic(self):
-        """resolve_provider_client(provider='anthropic', explicit_api_key=...) must propagate the key."""
+    def test_resolve_provider_client_ignores_explicit_anthropic_api_key(self):
+        """The central resolver must not forward an API key to native Anthropic."""
         with patch("agent.anthropic_adapter.resolve_anthropic_token", return_value="env-key"), \
              patch("agent.anthropic_adapter.build_anthropic_client") as mock_build, \
              patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)):
@@ -4879,10 +4884,11 @@ class TestAnthropicExplicitApiKey:
                 provider="anthropic",
                 explicit_api_key="explicit-fallback-key",
             )
-        assert client is not None
-        assert mock_build.call_args.args[0] == "explicit-fallback-key", (
-            "resolve_provider_client must forward explicit_api_key to _try_anthropic()"
-        )
+        from openai import OpenAI
+        assert isinstance(client, OpenAI)
+        assert str(client.base_url).rstrip("/") == "http://127.0.0.1:4100/v1"
+        assert client.api_key == "test-claude-proxy-token"
+        mock_build.assert_not_called()
 
 
 # ── Auxiliary unhealthy-provider TTL cache (issue #23570) ────────────────

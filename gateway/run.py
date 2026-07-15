@@ -1852,10 +1852,27 @@ def _resolve_runtime_agent_kwargs() -> dict:
         _get_model_config,
     )
     from hermes_cli.auth import AuthError, is_rate_limited_auth_error
+    from hermes_cli.claude_route_policy import ClaudeRouteError, is_claude_route
+
+    model_cfg = _get_model_config()
+    primary_is_claude = is_claude_route(
+        provider=(model_cfg or {}).get("provider"),
+        model=(model_cfg or {}).get("default"),
+        base_url=(model_cfg or {}).get("base_url"),
+    )
 
     try:
         runtime = resolve_runtime_provider()
+    except ClaudeRouteError:
+        # Claude policy failures are terminal for the Claude route.  In
+        # particular, never let a missing proxy token/endpoint/model turn into
+        # a non-Claude gateway fallback.
+        raise
     except AuthError as auth_exc:
+        if primary_is_claude:
+            # A generic auth error from a Claude-class primary is also not
+            # fallbackable; preserve the operator's route boundary.
+            raise RuntimeError(format_runtime_provider_error(auth_exc)) from auth_exc
         # Distinguish a transient rate-limit/quota cap (credentials are fine,
         # re-auth cannot help) from a genuine auth failure (expired/revoked
         # token). Both fall through to the fallback chain, but the log message
@@ -1871,7 +1888,6 @@ def _resolve_runtime_agent_kwargs() -> dict:
     except Exception as exc:
         raise RuntimeError(format_runtime_provider_error(exc)) from exc
 
-    model_cfg = _get_model_config()
     max_tokens = None
     _env_mt = os.environ.get("HERMES_MAX_TOKENS")
     if _env_mt:

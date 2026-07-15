@@ -1241,6 +1241,22 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     auth resolution and client construction — no duplicated provider→key
     mappings.
     """
+    # A Claude request is pinned to the OAuth mini-proxy. Do not turn a
+    # proxy outage, quota error, or route-policy failure into a different
+    # provider. The caller must surface the locked-route failure honestly.
+    from hermes_cli.claude_route_policy import is_claude_route
+
+    if getattr(agent, "_claude_proxy_locked", False) is True or is_claude_route(
+        provider=getattr(agent, "provider", None),
+        model=getattr(agent, "model", None),
+    ):
+        logger.warning(
+            "Fallback suppressed: Claude request is locked to the OAuth mini-proxy (%s/%s)",
+            getattr(agent, "provider", ""),
+            getattr(agent, "model", ""),
+        )
+        return False
+
     if reason in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}:
         # Only start cooldown when leaving the primary provider.  If we're
         # already on a fallback and chain-switching, the primary wasn't the

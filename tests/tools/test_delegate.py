@@ -45,7 +45,10 @@ def _make_mock_parent(depth=0):
     parent.api_key="***"
     parent.provider = "openrouter"
     parent.api_mode = "chat_completions"
-    parent.model = "anthropic/claude-sonnet-4"
+    # Delegation lifecycle tests use a non-Claude fixture.  Claude identity
+    # is fail-closed to the OAuth mini-proxy and is covered by route-specific
+    # tests; these tests exercise child construction and cost rollup.
+    parent.model = "gpt-4o-mini"
     parent.platform = "cli"
     parent.providers_allowed = None
     parent.providers_ignored = None

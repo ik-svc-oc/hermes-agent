@@ -3,7 +3,7 @@
 from unittest.mock import patch
 
 
-def _build_agent(model_cfg, custom_providers=None, model="anthropic/claude-opus-4.6"):
+def _build_agent(model_cfg, custom_providers=None, model="gpt5.4"):
     """Build an AIAgent with the given model config."""
     cfg = {"model": model_cfg}
     if custom_providers is not None:

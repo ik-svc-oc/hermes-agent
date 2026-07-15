@@ -3632,9 +3632,17 @@ def test_config_set_model_explicit_provider_skips_broken_default_init(monkeypatc
             raise RuntimeError("broken default provider should not be initialized")
         if requested == "anthropic":
             return {
-                "api_key": "sk-anthropic",
-                "api_mode": "anthropic_messages",
-                "base_url": "https://api.anthropic.com",
+                "provider": "claude-proxy",
+                "api_key": "proxy-token",
+                "api_mode": "chat_completions",
+                "base_url": "http://127.0.0.1:4100/v1",
+            }
+        if requested == "claude-proxy":
+            return {
+                "provider": "claude-proxy",
+                "api_key": "proxy-token",
+                "api_mode": "chat_completions",
+                "base_url": "http://127.0.0.1:4100/v1",
             }
         raise RuntimeError(f"unexpected provider {requested}")
 
@@ -3653,12 +3661,15 @@ def test_config_set_model_explicit_provider_skips_broken_default_init(monkeypatc
             }
         )
 
-        assert resp["result"]["value"] == "claude-sonnet-4-6"
+        assert resp["result"]["value"] == "claude-sonnet-4.6"
         assert seen["build"] == 0
         assert seen["wait"] == 0
-        assert seen["requested"] == [("anthropic", "claude-sonnet-4.6")]
-        assert session["model_override"]["provider"] == "anthropic"
-        assert session["model_override"]["model"] == "claude-sonnet-4-6"
+        assert seen["requested"] == [
+            ("anthropic", "claude-sonnet-4.6"),
+            ("claude-proxy", "claude-sonnet-4.6"),
+        ]
+        assert session["model_override"]["provider"] == "claude-proxy"
+        assert session["model_override"]["model"] == "claude-sonnet-4.6"
     finally:
         server._sessions.pop("sid", None)
 

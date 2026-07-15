@@ -56,6 +56,82 @@ def _ra():
     return run_agent
 
 
+def _lock_primary_runtime_if_claude(runtime: Dict[str, Any]) -> Dict[str, Any]:
+    """Rewrite stale primary snapshots onto the fixed Claude proxy route.
+
+    Older sessions and pre-policy snapshots can still contain native
+    Anthropic, Bedrock, or OpenRouter endpoint fields. Restoration and
+    transport-recovery must not treat those persisted fields as authority.
+    The model identity is retained, while endpoint, credential, transport,
+    and cache-layout fields are replaced with the shared OAuth mini-proxy
+    contract. A policy error propagates to the caller; it is never a fallback
+    signal.
+    """
+    from hermes_cli.claude_route_policy import (
+        is_claude_route,
+        resolve_claude_proxy_runtime,
+    )
+
+    provider = runtime.get("provider")
+    model = runtime.get("model")
+    base_url = runtime.get("base_url")
+    if not is_claude_route(provider=provider, model=model, base_url=base_url):
+        return runtime
+
+    proxy = resolve_claude_proxy_runtime(
+        requested_provider=provider,
+        target_model=model,
+        # A persisted native endpoint is evidence of the old route, not an
+        # operator-authorized override. Ignore it while selecting the proxy.
+        explicit_base_url=None,
+        model_cfg={},
+    )
+    locked = dict(runtime)
+    locked.update(
+        {
+            "provider": proxy["provider"],
+            "model": proxy.get("model") or model,
+            "base_url": proxy["base_url"],
+            "api_mode": proxy["api_mode"],
+            "api_key": proxy["api_key"],
+            "claude_proxy_locked": True,
+            "use_native_cache_layout": False,
+        }
+    )
+    client_kwargs = dict(runtime.get("client_kwargs") or {})
+    client_kwargs.update({"api_key": proxy["api_key"], "base_url": proxy["base_url"]})
+    client_kwargs.pop("default_headers", None)
+    client_kwargs.pop("default_query", None)
+    client_kwargs.pop("command", None)
+    client_kwargs.pop("args", None)
+    locked["client_kwargs"] = client_kwargs
+
+    compressor_provider = runtime.get("compressor_provider")
+    compressor_model = runtime.get("compressor_model")
+    compressor_base_url = runtime.get("compressor_base_url")
+    if is_claude_route(
+        provider=compressor_provider,
+        model=compressor_model,
+        base_url=compressor_base_url,
+    ):
+        compressor_proxy = resolve_claude_proxy_runtime(
+            requested_provider=compressor_provider,
+            target_model=compressor_model,
+            explicit_base_url=None,
+            model_cfg={},
+        )
+        locked.update(
+            {
+                "compressor_provider": compressor_proxy["provider"],
+                "compressor_model": compressor_proxy.get("model") or compressor_model,
+                "compressor_base_url": compressor_proxy["base_url"],
+                "compressor_api_key": compressor_proxy["api_key"],
+                "compressor_api_mode": compressor_proxy["api_mode"],
+            }
+        )
+    return locked
+
+
 AGENT_RUNTIME_POST_HOOK_TOOL_NAMES = frozenset(
     {"todo", "session_search", "memory", "clarify", "read_terminal", "delegate_task"}
 )
@@ -998,12 +1074,23 @@ def try_recover_primary_transport(
                 pass
 
         # Rebuild from primary snapshot
-        rt = agent._primary_runtime
+        rt = _lock_primary_runtime_if_claude(agent._primary_runtime)
+        agent._primary_runtime = rt
         agent._client_kwargs = dict(rt["client_kwargs"])
         agent.model = rt["model"]
         agent.provider = rt["provider"]
         agent.base_url = rt["base_url"]
         agent.api_mode = rt["api_mode"]
+        from hermes_cli.claude_route_policy import is_claude_route
+
+        agent._claude_proxy_locked = bool(
+            rt.get("claude_proxy_locked")
+            or is_claude_route(
+                provider=rt.get("provider"),
+                model=rt.get("model"),
+                base_url=rt.get("base_url"),
+            )
+        )
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
         agent.api_key = rt["api_key"]
@@ -1160,13 +1247,24 @@ def restore_primary_runtime(agent) -> bool:
     if getattr(agent, "_rate_limited_until", 0) > time.monotonic():
         return False  # primary still in rate-limit cooldown, stay on fallback
 
-    rt = agent._primary_runtime
+    rt = _lock_primary_runtime_if_claude(agent._primary_runtime)
+    agent._primary_runtime = rt
     try:
         # ── Core runtime state ──
         agent.model = rt["model"]
         agent.provider = rt["provider"]
         agent.base_url = rt["base_url"]           # setter updates _base_url_lower
         agent.api_mode = rt["api_mode"]
+        from hermes_cli.claude_route_policy import is_claude_route
+
+        agent._claude_proxy_locked = bool(
+            rt.get("claude_proxy_locked")
+            or is_claude_route(
+                provider=rt.get("provider"),
+                model=rt.get("model"),
+                base_url=rt.get("base_url"),
+            )
+        )
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
         agent.api_key = rt["api_key"]
@@ -1739,6 +1837,25 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
     turn-scoped).
     """
     from hermes_cli.providers import determine_api_mode
+    from hermes_cli.claude_route_policy import resolve_claude_proxy_runtime
+
+    # Direct library callers can invoke this method without first passing
+    # through hermes_cli.model_switch. Keep the live-agent swap on the same
+    # closed Claude route: native Anthropic, Bedrock, OpenRouter Claude, and
+    # any API-key endpoint are rewritten to the OAuth mini-proxy or rejected.
+    _claude_runtime = resolve_claude_proxy_runtime(
+        requested_provider=new_provider,
+        target_model=new_model,
+        explicit_base_url=base_url,
+        model_cfg={},
+    )
+    _claude_route_locked = _claude_runtime is not None
+    if _claude_runtime is not None:
+        new_provider = str(_claude_runtime["provider"])
+        new_model = str(_claude_runtime.get("model") or new_model)
+        api_key = str(_claude_runtime["api_key"])
+        base_url = str(_claude_runtime["base_url"])
+        api_mode = str(_claude_runtime["api_mode"])
 
     # ── Determine api_mode if not provided ──
     if not api_mode:
@@ -1786,6 +1903,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             "_anthropic_base_url",
             "_is_anthropic_oauth",
             "_config_context_length",
+            "_claude_proxy_locked",
         )
     }
     # _client_kwargs is a dict — snapshot a shallow copy so mutating the
@@ -1805,6 +1923,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         # ── Swap core runtime fields ──
         agent.model = new_model
         agent.provider = new_provider
+        agent._claude_proxy_locked = _claude_route_locked
         # Use new base_url when provided; only fall back to current when the
         # new provider genuinely has no endpoint (e.g. native SDK providers).
         # Without this guard the old provider's URL (e.g. Ollama's localhost
@@ -2013,6 +2132,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         "provider": agent.provider,
         "base_url": agent.base_url,
         "api_mode": agent.api_mode,
+        "claude_proxy_locked": bool(getattr(agent, "_claude_proxy_locked", False)),
         "api_key": getattr(agent, "api_key", ""),
         "client_kwargs": dict(agent._client_kwargs),
         "use_prompt_caching": agent._use_prompt_caching,
@@ -2053,6 +2173,9 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         ]
     agent._fallback_chain = fallback_chain
     agent._fallback_model = fallback_chain[0] if fallback_chain else None
+    if getattr(agent, "_claude_proxy_locked", False):
+        agent._fallback_chain = []
+        agent._fallback_model = None
 
     logger.info(
         "Model switched in-place: %s (%s) -> %s (%s)",

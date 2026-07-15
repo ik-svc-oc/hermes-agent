@@ -651,7 +651,7 @@ class TestStreamingFallback:
         mock_create.return_value = mock_client
 
         agent = AIAgent(
-            model="claude-sonnet-4.6",
+            model="gpt-4o",
             provider="copilot-acp",
             api_key="test-key",
             base_url="http://localhost:1234/v1",
@@ -1652,7 +1652,7 @@ def _make_acp_agent(provider="copilot-acp", base_url="acp://copilot"):
         api_key="test-acp-key",
         base_url=base_url,
         provider=provider,
-        model="claude-opus-4.7",
+        model="gpt-4o",
         quiet_mode=True,
         skip_context_files=True,
         skip_memory=True,
@@ -1783,7 +1783,7 @@ class TestBedrockIamStreamingFallback:
         agent = AIAgent(
             api_key="test-key",
             base_url="https://openrouter.ai/api/v1",
-            model="anthropic.claude-3-sonnet-20240229-v1:0",
+            model="amazon.nova-lite-v1:0",
             quiet_mode=True,
             skip_context_files=True,
             skip_memory=True,

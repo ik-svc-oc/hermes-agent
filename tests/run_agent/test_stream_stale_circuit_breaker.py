@@ -28,7 +28,8 @@ def _make_anthropic_agent(**kwargs):
 
     defaults = dict(
         api_key="test-key",
-        base_url="https://example.com/v1",
+        base_url="http://127.0.0.1:4100/v1",
+        provider="claude-proxy",
         model="claude-opus-4-7",
         quiet_mode=True,
         skip_context_files=True,

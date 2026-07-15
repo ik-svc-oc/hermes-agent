@@ -120,11 +120,11 @@ def test_routed_client_preserves_openai_sdk_default_headers(mock_openai):
 
     with patch("agent.auxiliary_client.resolve_provider_client", return_value=(
         routed_client,
-        "claude-opus-4.7",
+        "gpt-4o",
     )):
         agent = AIAgent(
             provider="copilot",
-            model="claude-opus-4.7",
+            model="gpt-4o",
             quiet_mode=True,
             skip_context_files=True,
             skip_memory=True,
@@ -333,7 +333,7 @@ def test_copilot_enterprise_base_url_applies_copilot_default_headers(mock_openai
     agent = AIAgent(
         api_key="test-key",
         base_url="https://api.enterprise.githubcopilot.com",
-        model="claude-opus-4.6-1m",
+        model="gpt-4o",
         provider="copilot",
         quiet_mode=True,
         skip_context_files=True,

@@ -198,8 +198,8 @@ def test_reasoning_floor_applies_to_opus_4_thinking(monkeypatch, tmp_path):
 
     agent = _make_agent(
         tmp_path,
-        provider="anthropic",
-        base_url="https://api.anthropic.com",
+        provider="claude-proxy",
+        base_url="http://127.0.0.1:4100/v1",
         model="claude-opus-4-6",
     )
     base, implicit = agent._resolved_api_call_stale_timeout_base()

@@ -418,6 +418,34 @@ def init_agent(
     agent.base_url = base_url or ""
     provider_name = provider.strip().lower() if isinstance(provider, str) and provider.strip() else None
     agent.provider = provider_name or ""
+
+    # Last-mile constructor backstop: library callers can instantiate
+    # ``AIAgent(provider="anthropic", ...)`` without going through the CLI
+    # runtime resolver.  That must not reopen native Anthropic, Bedrock,
+    # OpenRouter, or API-key routing for a Claude model.  Rewrite every
+    # recognizably-Claude constructor to the locked OAuth mini-proxy before
+    # transport selection; policy errors deliberately propagate.
+    from hermes_cli.claude_route_policy import resolve_claude_proxy_runtime
+
+    _claude_runtime = resolve_claude_proxy_runtime(
+        requested_provider=agent.provider,
+        target_model=agent.model,
+        explicit_base_url=agent.base_url,
+        model_cfg={},
+    )
+    if _claude_runtime is not None:
+        agent.provider = str(_claude_runtime["provider"])
+        agent.model = str(_claude_runtime.get("model") or agent.model)
+        # Update both the agent property and the local constructor values.
+        # The latter feeds client_kwargs below; changing only agent.base_url
+        # would leave a direct AIAgent caller's foreign endpoint in scope.
+        base_url = str(_claude_runtime["base_url"])
+        agent.base_url = base_url
+        api_key = str(_claude_runtime["api_key"])
+        api_mode = str(_claude_runtime["api_mode"])
+        agent._claude_proxy_locked = True
+    else:
+        agent._claude_proxy_locked = False
     agent.acp_command = acp_command or command
     agent.acp_args = list(acp_args or args or [])
     if api_mode in {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse", "codex_app_server"}:
@@ -1039,6 +1067,13 @@ def init_agent(
                         "select a provider, or run `hermes setup` for first-time "
                         "configuration."
                     )
+
+        if getattr(agent, "_claude_proxy_locked", False):
+            # Never let caller/config-provided client kwargs smuggle a foreign
+            # endpoint or API credential back in after the route backstop.
+            client_kwargs["api_key"] = api_key
+            client_kwargs["base_url"] = base_url
+            client_kwargs.pop("default_query", None)
         
         agent._client_kwargs = client_kwargs  # stored for rebuilding after interrupt
 
@@ -1135,6 +1170,23 @@ def init_agent(
     elif isinstance(fallback_model, dict) and fallback_model.get("provider") and fallback_model.get("model"):
         agent._fallback_chain = [fallback_model]
     else:
+        agent._fallback_chain = []
+    # Claude/Anthropic is not failover-capable: every sanctioned Claude model
+    # must remain on the OAuth mini-proxy. Keep this marker on the agent so
+    # every later conversation-loop fallback entry point can enforce the same
+    # boundary without guessing from the client object.
+    try:
+        from hermes_cli.claude_route_policy import is_claude_route
+
+        agent._claude_proxy_locked = is_claude_route(
+            provider=getattr(agent, "provider", None),
+            model=getattr(agent, "model", None),
+        )
+    except Exception:
+        # Preserve an earlier locked state if policy classification cannot be
+        # recomputed. A policy/loader error must not reopen fallback routing.
+        agent._claude_proxy_locked = bool(getattr(agent, "_claude_proxy_locked", False))
+    if agent._claude_proxy_locked:
         agent._fallback_chain = []
     agent._fallback_index = 0
     agent._fallback_activated = getattr(agent, "_fallback_activated", False)
@@ -2077,6 +2129,7 @@ def init_agent(
         "provider": agent.provider,
         "base_url": agent.base_url,
         "api_mode": agent.api_mode,
+        "claude_proxy_locked": bool(getattr(agent, "_claude_proxy_locked", False)),
         "api_key": getattr(agent, "api_key", ""),
         "client_kwargs": dict(agent._client_kwargs),
         "use_prompt_caching": agent._use_prompt_caching,

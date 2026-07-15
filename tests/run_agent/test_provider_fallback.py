@@ -295,14 +295,14 @@ class TestFallbackChainDedup:
         with the same model should dedup even if their provider names differ."""
         fbs = [
             # Different provider name but same shim URL + model — same backend.
-            {"provider": "claude-cli-alt", "model": "claude-opus-4.7",
+            {"provider": "custom-alt", "model": "test-model",
              "base_url": "http://127.0.0.1:7891/v1"},
             # Real different fallback.
-            {"provider": "openrouter", "model": "anthropic/claude-opus-4.7"},
+            {"provider": "openrouter", "model": "openai/gpt-4o"},
         ]
         agent = _make_agent(fallback_model=fbs)
-        agent.provider = "claude-cli"
-        agent.model = "claude-opus-4.7"
+        agent.provider = "custom"
+        agent.model = "test-model"
         agent.base_url = "http://127.0.0.1:7891/v1"
 
         called = []
@@ -315,7 +315,7 @@ class TestFallbackChainDedup:
 
         assert ok is True
         # Same shim/base_url+model entry skipped, second one used.
-        assert called == [("openrouter", "anthropic/claude-opus-4.7")], (
+        assert called == [("openrouter", "openai/gpt-4o")], (
             f"expected base_url-aware dedup, got call order: {called}"
         )
 

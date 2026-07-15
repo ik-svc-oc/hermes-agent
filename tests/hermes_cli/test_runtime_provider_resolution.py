@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from hermes_cli import runtime_provider as rp
+from hermes_cli.claude_route_policy import ClaudeRouteError
 
 
 def _fake_invoke_jwt(ttl_seconds=3600):
@@ -75,20 +76,7 @@ def test_resolve_runtime_provider_nous_pool_uses_env_base_url_override(monkeypat
     assert resolved["base_url"] == "https://ai.wildebeest-newton.ts.net/v1"
 
 
-def test_resolve_runtime_provider_anthropic_pool_respects_config_base_url(monkeypatch):
-    class _Entry:
-        access_token = "pool-token"
-        source = "manual"
-        base_url = "https://api.anthropic.com"
-
-    class _Pool:
-        def has_credentials(self):
-            return True
-
-        def select(self):
-            return _Entry()
-
-    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "anthropic")
+def test_resolve_runtime_provider_anthropic_rejects_foreign_config_base_url(monkeypatch):
     monkeypatch.setattr(
         rp,
         "_get_model_config",
@@ -97,35 +85,15 @@ def test_resolve_runtime_provider_anthropic_pool_respects_config_base_url(monkey
             "base_url": "https://proxy.example.com/anthropic",
         },
     )
-    monkeypatch.setattr(rp, "load_pool", lambda provider: _Pool())
 
-    resolved = rp.resolve_runtime_provider(requested="anthropic")
+    with pytest.raises(ClaudeRouteError) as exc_info:
+        rp.resolve_runtime_provider(requested="anthropic")
 
-    assert resolved["provider"] == "anthropic"
-    assert resolved["api_mode"] == "anthropic_messages"
-    assert resolved["api_key"] == "pool-token"
-    assert resolved["base_url"] == "https://proxy.example.com/anthropic"
+    assert exc_info.value.code == "claude_proxy_endpoint_rejected"
 
 
-def test_resolve_runtime_provider_anthropic_ignores_stale_aggregator_base_url(monkeypatch):
-    """A leftover OpenRouter base_url under provider: anthropic must not hijack
-    Anthropic OAuth traffic — fall back to the official Anthropic host."""
-
-    class _Entry:
-        access_token = "pool-token"
-        source = "manual"
-        base_url = "https://api.anthropic.com"
-
-    class _Pool:
-        def has_credentials(self):
-            return True
-
-        def select(self):
-            return _Entry()
-
-    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "anthropic")
-    monkeypatch.setattr(rp, "load_pool", lambda provider: _Pool())
-
+def test_resolve_runtime_provider_anthropic_rejects_foreign_config_endpoints(monkeypatch):
+    """Stale aggregator endpoints cannot become native Anthropic fallbacks."""
     for stale in (
         "https://openrouter.ai/api/v1",
         "https://api.openai.com/v1",
@@ -135,48 +103,29 @@ def test_resolve_runtime_provider_anthropic_ignores_stale_aggregator_base_url(mo
             "_get_model_config",
             lambda stale=stale: {"provider": "anthropic", "base_url": stale},
         )
-        resolved = rp.resolve_runtime_provider(requested="anthropic")
-        assert resolved["provider"] == "anthropic"
-        assert resolved["api_mode"] == "anthropic_messages"
-        assert resolved["base_url"] == "https://api.anthropic.com", stale
+        with pytest.raises(ClaudeRouteError) as exc_info:
+            rp.resolve_runtime_provider(requested="anthropic")
+        assert exc_info.value.code == "claude_proxy_endpoint_rejected", stale
 
 
-def test_resolve_runtime_provider_anthropic_keeps_azure_base_url(monkeypatch):
-    """Azure Foundry Anthropic endpoints are not anthropic.com hosts but are a
-    legitimate override — they must survive the stale-URL guard."""
-
-    class _Entry:
-        access_token = "pool-token"
-        source = "manual"
-        base_url = "https://api.anthropic.com"
-
-    class _Pool:
-        def has_credentials(self):
-            return True
-
-        def select(self):
-            return _Entry()
-
-    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "anthropic")
-    monkeypatch.setattr(rp, "load_pool", lambda provider: _Pool())
+def test_resolve_runtime_provider_anthropic_rejects_azure_base_url(monkeypatch):
+    """Azure is not an alternate Claude route under the OAuth-only policy."""
     monkeypatch.setattr(
         rp,
         "_get_model_config",
-        lambda: {"provider": "anthropic", "base_url": "https://myhost.azure.com/anthropic"},
+        lambda: {
+            "provider": "anthropic",
+            "base_url": "https://myhost.azure.com/anthropic",
+        },
     )
 
-    resolved = rp.resolve_runtime_provider(requested="anthropic")
-    assert resolved["base_url"] == "https://myhost.azure.com/anthropic"
+    with pytest.raises(ClaudeRouteError) as exc_info:
+        rp.resolve_runtime_provider(requested="anthropic")
+
+    assert exc_info.value.code == "claude_proxy_endpoint_rejected"
 
 
-def test_resolve_runtime_provider_anthropic_explicit_override_skips_pool(monkeypatch):
-    def _unexpected_pool(provider):
-        raise AssertionError(f"load_pool should not be called for {provider}")
-
-    def _unexpected_anthropic_token():
-        raise AssertionError("resolve_anthropic_token should not be called")
-
-    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "anthropic")
+def test_resolve_runtime_provider_anthropic_rejects_explicit_foreign_override(monkeypatch):
     monkeypatch.setattr(
         rp,
         "_get_model_config",
@@ -185,24 +134,15 @@ def test_resolve_runtime_provider_anthropic_explicit_override_skips_pool(monkeyp
             "base_url": "https://config.example.com/anthropic",
         },
     )
-    monkeypatch.setattr(rp, "load_pool", _unexpected_pool)
-    monkeypatch.setattr(
-        "agent.anthropic_adapter.resolve_anthropic_token",
-        _unexpected_anthropic_token,
-    )
 
-    resolved = rp.resolve_runtime_provider(
-        requested="anthropic",
-        explicit_api_key="anthropic-explicit-token",
-        explicit_base_url="https://proxy.example.com/anthropic/",
-    )
+    with pytest.raises(ClaudeRouteError) as exc_info:
+        rp.resolve_runtime_provider(
+            requested="anthropic",
+            explicit_api_key="anthropic-explicit-token",
+            explicit_base_url="https://proxy.example.com/anthropic/",
+        )
 
-    assert resolved["provider"] == "anthropic"
-    assert resolved["api_mode"] == "anthropic_messages"
-    assert resolved["api_key"] == "anthropic-explicit-token"
-    assert resolved["base_url"] == "https://proxy.example.com/anthropic"
-    assert resolved["source"] == "explicit"
-    assert resolved.get("credential_pool") is None
+    assert exc_info.value.code == "claude_proxy_endpoint_rejected"
 
 
 def test_resolve_runtime_provider_falls_back_when_pool_empty(monkeypatch):
@@ -262,6 +202,7 @@ def test_resolve_runtime_provider_codex(monkeypatch):
 
 def test_resolve_runtime_provider_qwen_oauth(monkeypatch):
     monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "qwen-oauth")
+    monkeypatch.setattr(rp, "load_pool", lambda provider: None)
     monkeypatch.setattr(
         rp,
         "resolve_qwen_runtime_credentials",
@@ -322,6 +263,7 @@ def test_qwen_oauth_auto_fallthrough_on_auth_failure(monkeypatch):
     from hermes_cli.auth import AuthError
 
     monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "qwen-oauth")
+    monkeypatch.setattr(rp, "load_pool", lambda provider: None)
     monkeypatch.setattr(
         rp,
         "resolve_qwen_runtime_credentials",
@@ -999,8 +941,8 @@ def test_named_custom_provider_uses_key_env_from_providers_dict(monkeypatch):
     assert resolved["model"] == "acme-large"
 
 
-def test_named_custom_provider_same_url_uses_matching_key_env_and_api_mode(monkeypatch):
-    """Named custom providers on one gateway must keep their own credentials and protocol."""
+def test_named_custom_claude_provider_uses_fixed_proxy(monkeypatch):
+    """A named Claude entry cannot select its own gateway or API key."""
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     monkeypatch.setenv("GPT_KEY", "gpt-secret")
@@ -1039,12 +981,13 @@ def test_named_custom_provider_same_url_uses_matching_key_env_and_api_mode(monke
 
     resolved = rp.resolve_runtime_provider(requested="custom:claude")
 
-    assert resolved["provider"] == "custom"
-    assert resolved["base_url"] == "https://gateway.example.com"
-    assert resolved["api_key"] == "claude-secret"
-    assert resolved["api_mode"] == "anthropic_messages"
+    assert resolved["provider"] == "claude-proxy"
+    assert resolved["base_url"] == "http://127.0.0.1:4100/v1"
+    assert resolved["api_key"] == "test-claude-proxy-token"
+    assert resolved["api_mode"] == "chat_completions"
     assert resolved["requested_provider"] == "custom:claude"
     assert resolved["model"] == "claude-opus-4-8"
+    assert resolved["claude_proxy_locked"] is True
 
 
 def test_named_custom_provider_falls_back_to_openai_api_key(monkeypatch):
@@ -1637,7 +1580,7 @@ def test_opencode_zen_gpt_defaults_to_responses(monkeypatch):
     assert resolved["base_url"] == "https://opencode.ai/zen/v1"
 
 
-def test_opencode_zen_claude_defaults_to_messages(monkeypatch):
+def test_opencode_zen_claude_uses_fixed_proxy(monkeypatch):
     monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "opencode-zen")
     monkeypatch.setattr(rp, "_get_model_config", lambda: {"default": "claude-sonnet-4-6"})
     monkeypatch.setenv("OPENCODE_ZEN_API_KEY", "test-opencode-zen-key")
@@ -1645,11 +1588,10 @@ def test_opencode_zen_claude_defaults_to_messages(monkeypatch):
 
     resolved = rp.resolve_runtime_provider(requested="opencode-zen")
 
-    assert resolved["provider"] == "opencode-zen"
-    assert resolved["api_mode"] == "anthropic_messages"
-    # Trailing /v1 stripped for anthropic_messages mode — the Anthropic SDK
-    # appends its own /v1/messages to the base_url.
-    assert resolved["base_url"] == "https://opencode.ai/zen"
+    assert resolved["provider"] == "claude-proxy"
+    assert resolved["api_mode"] == "chat_completions"
+    assert resolved["base_url"] == "http://127.0.0.1:4100/v1"
+    assert resolved["claude_proxy_locked"] is True
 
 
 def test_opencode_go_minimax_defaults_to_messages(monkeypatch):
@@ -2375,151 +2317,35 @@ class TestAzureFoundryResolution:
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# Azure Anthropic — honor user-specified env var hints (key_env / api_key_env)
-#
-# When the user points provider=anthropic at an Azure Foundry base URL, the
-# runtime resolver previously hardcoded `AZURE_ANTHROPIC_KEY` and
-# `ANTHROPIC_API_KEY` as the only env var sources.  This meant
-# `key_env: MY_CUSTOM_VAR` on the model config was silently ignored — and
-# the Azure Foundry docs that showed `api_key_env:` were broken as a result.
-#
-# These tests lock in the priority chain:
-#   1. model_cfg.key_env → os.getenv(value)
-#   2. model_cfg.api_key_env → os.getenv(value) (docs alias)
-#   3. model_cfg.api_key (inline value)
-#   4. AZURE_ANTHROPIC_KEY env var
-#   5. ANTHROPIC_API_KEY env var
+# Native Anthropic/Azure endpoints are not fallback routes for Claude.
 # ──────────────────────────────────────────────────────────────────────────
 
 
 class TestAzureAnthropicEnvVarHint:
-    _AZURE_URL = "https://my-resource.services.ai.azure.com/anthropic"
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"key_env": "MY_CUSTOM_AZURE_KEY"},
+            {"api_key_env": "DOCS_VARIANT_KEY"},
+            {"key_env": "MY_PROVIDER_KEY"},
+            {"api_key": "inline-azure-key"},
+            {},
+            {"key_env": "UNSET_VAR"},
+            {"base_url": "https://api.anthropic.com", "key_env": "MY_KEY"},
+        ],
+    )
+    def test_non_loopback_anthropic_endpoint_is_rejected(self, monkeypatch, overrides):
+        config = {
+            "provider": "anthropic",
+            "base_url": "https://my-resource.services.ai.azure.com/anthropic",
+        }
+        config.update(overrides)
+        monkeypatch.setattr(rp, "_get_model_config", lambda: config)
 
-    def _cfg(self, **overrides):
-        base = {"provider": "anthropic", "base_url": self._AZURE_URL}
-        base.update(overrides)
-        return base
-
-    def test_key_env_hint_picks_custom_var(self, monkeypatch):
-        """model.key_env names a non-default env var → that var's value is used."""
-        monkeypatch.delenv("AZURE_ANTHROPIC_KEY", raising=False)
-        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-        monkeypatch.setenv("MY_CUSTOM_AZURE_KEY", "from-custom-var")
-        monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "anthropic")
-        monkeypatch.setattr(rp, "_get_model_config",
-                            lambda: self._cfg(key_env="MY_CUSTOM_AZURE_KEY"))
-        monkeypatch.setattr(rp, "load_pool", lambda provider: None)
-
-        resolved = rp.resolve_runtime_provider(requested="anthropic")
-
-        assert resolved["api_key"] == "from-custom-var"
-        assert resolved["base_url"] == self._AZURE_URL
-
-    def test_api_key_env_alias_honored(self, monkeypatch):
-        """The `api_key_env` alias (used in azure-foundry docs) also works."""
-        monkeypatch.delenv("AZURE_ANTHROPIC_KEY", raising=False)
-        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-        monkeypatch.setenv("DOCS_VARIANT_KEY", "from-docs-alias")
-        monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "anthropic")
-        monkeypatch.setattr(rp, "_get_model_config",
-                            lambda: self._cfg(api_key_env="DOCS_VARIANT_KEY"))
-        monkeypatch.setattr(rp, "load_pool", lambda provider: None)
-
-        resolved = rp.resolve_runtime_provider(requested="anthropic")
-
-        assert resolved["api_key"] == "from-docs-alias"
-
-    def test_key_env_beats_fallback_chain(self, monkeypatch):
-        """key_env takes priority over AZURE_ANTHROPIC_KEY / ANTHROPIC_API_KEY."""
-        monkeypatch.setenv("AZURE_ANTHROPIC_KEY", "should-not-win")
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "should-not-win-either")
-        monkeypatch.setenv("MY_PROVIDER_KEY", "winning-key")
-        monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "anthropic")
-        monkeypatch.setattr(rp, "_get_model_config",
-                            lambda: self._cfg(key_env="MY_PROVIDER_KEY"))
-        monkeypatch.setattr(rp, "load_pool", lambda provider: None)
-
-        resolved = rp.resolve_runtime_provider(requested="anthropic")
-
-        assert resolved["api_key"] == "winning-key"
-
-    def test_inline_api_key_on_model_cfg(self, monkeypatch):
-        """model.api_key (inline value) works for single-config setups."""
-        monkeypatch.delenv("AZURE_ANTHROPIC_KEY", raising=False)
-        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-        monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "anthropic")
-        monkeypatch.setattr(rp, "_get_model_config",
-                            lambda: self._cfg(api_key="inline-azure-key"))
-        monkeypatch.setattr(rp, "load_pool", lambda provider: None)
-
-        resolved = rp.resolve_runtime_provider(requested="anthropic")
-
-        assert resolved["api_key"] == "inline-azure-key"
-
-    def test_azure_anthropic_key_still_works_as_fallback(self, monkeypatch):
-        """Historical fixed-name env vars still resolve when no hint is set."""
-        monkeypatch.setenv("AZURE_ANTHROPIC_KEY", "historical-key")
-        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-        monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "anthropic")
-        monkeypatch.setattr(rp, "_get_model_config", lambda: self._cfg())
-        monkeypatch.setattr(rp, "load_pool", lambda provider: None)
-
-        resolved = rp.resolve_runtime_provider(requested="anthropic")
-
-        assert resolved["api_key"] == "historical-key"
-
-    def test_key_env_points_at_unset_var_falls_through(self, monkeypatch):
-        """If key_env names an env var that isn't set, fall through to the
-        historical fixed names rather than failing outright."""
-        monkeypatch.setenv("AZURE_ANTHROPIC_KEY", "fallback-works")
-        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-        monkeypatch.delenv("UNSET_VAR", raising=False)
-        monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "anthropic")
-        monkeypatch.setattr(rp, "_get_model_config",
-                            lambda: self._cfg(key_env="UNSET_VAR"))
-        monkeypatch.setattr(rp, "load_pool", lambda provider: None)
-
-        resolved = rp.resolve_runtime_provider(requested="anthropic")
-
-        assert resolved["api_key"] == "fallback-works"
-
-
-    def test_no_key_anywhere_raises_helpful_error(self, monkeypatch):
-        """When nothing resolves, the error message mentions key_env as an option."""
-        monkeypatch.delenv("AZURE_ANTHROPIC_KEY", raising=False)
-        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-        monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "anthropic")
-        monkeypatch.setattr(rp, "_get_model_config", lambda: self._cfg())
-        monkeypatch.setattr(rp, "load_pool", lambda provider: None)
-
-        with pytest.raises(rp.AuthError, match="key_env"):
+        with pytest.raises(ClaudeRouteError) as exc_info:
             rp.resolve_runtime_provider(requested="anthropic")
 
-    def test_non_azure_anthropic_path_ignores_key_env(self, monkeypatch):
-        """key_env is only consulted on Azure endpoints — non-Azure Anthropic
-        still goes through the regular resolve_anthropic_token chain."""
-        monkeypatch.setenv("MY_KEY", "custom-key-value")
-        monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "anthropic")
-        monkeypatch.setattr(rp, "_get_model_config", lambda: {
-            "provider": "anthropic",
-            "base_url": "https://api.anthropic.com",  # non-Azure
-            "key_env": "MY_KEY",
-        })
-        monkeypatch.setattr(rp, "load_pool", lambda provider: None)
-        called = {"resolve_anthropic_token": False}
-        def _fake_resolve():
-            called["resolve_anthropic_token"] = True
-            return "token-from-resolver"
-        monkeypatch.setattr(
-            "agent.anthropic_adapter.resolve_anthropic_token",
-            _fake_resolve,
-        )
-
-        resolved = rp.resolve_runtime_provider(requested="anthropic")
-
-        # The normal chain runs — key_env is not consulted off-Azure.
-        assert called["resolve_anthropic_token"] is True
-        assert resolved["api_key"] == "token-from-resolver"
+        assert exc_info.value.code == "claude_proxy_endpoint_rejected"
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -3087,16 +2913,8 @@ def _patch_bedrock(monkeypatch, config_default=""):
     monkeypatch.setattr(ba, "resolve_bedrock_region", lambda: "eu-north-1")
 
 
-def test_resolve_runtime_provider_bedrock_claude_target_model_uses_anthropic_messages(monkeypatch):
-    """Claude-on-Bedrock delegation must route through the AnthropicBedrock SDK.
-
-    Regression for #49095: the bedrock branch derived api_mode from the stale
-    persisted ``model.default`` instead of ``target_model``. When delegation
-    targets a Claude model but the parent's default is non-Claude, the wrong
-    branch (Converse) was picked, and the child silently fell back to
-    openrouter/free. ``target_model`` must win so Claude keeps the
-    anthropic_messages path (prompt caching, thinking budgets).
-    """
+def test_resolve_runtime_provider_bedrock_claude_target_model_uses_fixed_proxy(monkeypatch):
+    """Claude-on-Bedrock requests cannot select Bedrock as an alternate route."""
     _patch_bedrock(monkeypatch, config_default="amazon.nova-pro-v1:0")
 
     resolved = rp.resolve_runtime_provider(
@@ -3104,9 +2922,10 @@ def test_resolve_runtime_provider_bedrock_claude_target_model_uses_anthropic_mes
         target_model="global.anthropic.claude-sonnet-4-6",
     )
 
-    assert resolved["provider"] == "bedrock"
-    assert resolved["api_mode"] == "anthropic_messages"
-    assert resolved.get("bedrock_anthropic") is True
+    assert resolved["provider"] == "claude-proxy"
+    assert resolved["api_mode"] == "chat_completions"
+    assert resolved["base_url"] == "http://127.0.0.1:4100/v1"
+    assert resolved["claude_proxy_locked"] is True
 
 
 def test_resolve_runtime_provider_bedrock_nonclaude_target_model_uses_converse(monkeypatch):

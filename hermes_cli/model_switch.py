@@ -843,6 +843,11 @@ def switch_model(
         opencode_model_api_mode,
     )
     from hermes_cli.runtime_provider import resolve_runtime_provider
+    from hermes_cli.claude_route_policy import (
+        ClaudeRouteError,
+        effective_model as effective_claude_model,
+        is_claude_route,
+    )
 
     resolved_alias = ""
     new_model = raw_input.strip()
@@ -1241,7 +1246,34 @@ def switch_model(
             pass
 
     # --- Direct alias override: use exact base_url from the alias if set ---
-    if resolved_alias:
+    claude_route_locked = is_claude_route(
+        provider=target_provider,
+        model=new_model,
+        base_url=base_url,
+    )
+    if claude_route_locked:
+        try:
+            runtime = resolve_runtime_provider(
+                requested="claude-proxy",
+                target_model=new_model or None,
+            )
+        except ClaudeRouteError as exc:
+            return ModelSwitchResult(
+                success=False,
+                new_model=new_model,
+                target_provider="claude-proxy",
+                provider_label="Claude OAuth mini-proxy",
+                is_global=is_global,
+                error_message=str(exc),
+            )
+        target_provider = "claude-proxy"
+        provider_label = "Claude OAuth mini-proxy"
+        new_model = effective_claude_model(new_model) or runtime.get("model") or ""
+        api_key = runtime.get("api_key", "")
+        base_url = runtime.get("base_url", "")
+        api_mode = runtime.get("api_mode", "chat_completions")
+
+    if resolved_alias and not claude_route_locked:
         _ensure_direct_aliases()
         _da = DIRECT_ALIASES.get(resolved_alias)
         if _da is not None and _da.base_url:
@@ -1255,12 +1287,16 @@ def switch_model(
 
     # --- Validate ---
     try:
-        validation = validate_requested_model(
-            new_model,
-            target_provider,
-            api_key=api_key,
-            base_url=base_url,
-            api_mode=api_mode or None,
+        validation = (
+            {"accepted": True, "persist": True, "recognized": True, "message": ""}
+            if claude_route_locked
+            else validate_requested_model(
+                new_model,
+                target_provider,
+                api_key=api_key,
+                base_url=base_url,
+                api_mode=api_mode or None,
+            )
         )
     except Exception as e:
         validation = {

@@ -45,7 +45,10 @@ def test_custom_endpoint_anthropic_messages_builds_anthropic_wrapper():
         ),
     ), patch(
         "agent.auxiliary_client._read_main_model",
-        return_value="claude-sonnet-4-6",
+        # This is a third-party Anthropic-compatible model.  Claude identity
+        # is reserved for the OAuth mini-proxy and must not be used to model
+        # an unrelated MiniMax endpoint.
+        return_value="MiniMax-M2.5",
     ):
         adapter_patch, fake_client = _install_anthropic_adapter_mocks()
         with adapter_patch:
@@ -55,7 +58,7 @@ def test_custom_endpoint_anthropic_messages_builds_anthropic_wrapper():
         "Custom endpoint with api_mode=anthropic_messages must return the "
         f"native Anthropic wrapper, got {type(client).__name__}"
     )
-    assert model == "claude-sonnet-4-6"
+    assert model == "MiniMax-M2.5"
     # Wrapper should NOT be marked as OAuth — third-party endpoints are
     # always API-key authenticated.
     assert client.api_key == "minimax-key"
@@ -73,7 +76,7 @@ def test_custom_endpoint_anthropic_messages_falls_back_when_sdk_missing():
         return_value=("https://api.minimax.io/anthropic", "k", "anthropic_messages"),
     ), patch(
         "agent.auxiliary_client._read_main_model",
-        return_value="claude-sonnet-4-6",
+        return_value="MiniMax-M2.5",
     ), patch(
         "agent.anthropic_adapter.build_anthropic_client",
         side_effect=import_error,
@@ -83,7 +86,7 @@ def test_custom_endpoint_anthropic_messages_falls_back_when_sdk_missing():
     # Should fall back to an OpenAI-wire client rather than returning
     # (None, None) — the tool still needs to do *something*.
     assert client is not None
-    assert model == "claude-sonnet-4-6"
+    assert model == "MiniMax-M2.5"
     # OpenAI client, not AnthropicAuxiliaryClient.
     from agent.auxiliary_client import AnthropicAuxiliaryClient
     assert not isinstance(client, AnthropicAuxiliaryClient)

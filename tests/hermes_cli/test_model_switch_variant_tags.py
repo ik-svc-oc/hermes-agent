@@ -42,7 +42,7 @@ class TestVariantTagPreservation:
 
     @pytest.mark.parametrize("model,expected", [
         ("nvidia/nemotron-3-super-120b-a12b:free", "nvidia/nemotron-3-super-120b-a12b:free"),
-        ("anthropic/claude-sonnet-4.6:extended", "anthropic/claude-sonnet-4.6:extended"),
+        ("anthropic/claude-sonnet-4.6:extended", "claude-sonnet-4.6:extended"),
         ("meta-llama/llama-4-maverick:fast", "meta-llama/llama-4-maverick:fast"),
     ])
     def test_slash_format_preserves_variant_tag(self, model, expected):
@@ -62,9 +62,9 @@ class TestVariantTagPreservation:
     def test_bare_model_name_unaffected(self):
         """Bare model names without colons or slashes should work normally."""
         result = _run_switch("claude-sonnet-4.6")
-        assert result == "anthropic/claude-sonnet-4.6"
+        assert result == "claude-sonnet-4.6"
 
     def test_already_correct_slug_no_tag(self):
         """Standard vendor/model slugs without tags pass through unchanged."""
         result = _run_switch("anthropic/claude-sonnet-4.6")
-        assert result == "anthropic/claude-sonnet-4.6"
+        assert result == "claude-sonnet-4.6"

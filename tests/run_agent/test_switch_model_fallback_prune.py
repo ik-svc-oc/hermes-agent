@@ -45,11 +45,11 @@ def _switch_to_anthropic(agent):
         patch("hermes_cli.timeouts.get_provider_request_timeout", return_value=None),
     ):
         agent.switch_model(
-            new_model="claude-sonnet-4-5",
+            new_model="claude-sonnet-4-6",
             new_provider="anthropic",
             api_key="sk-ant-xyz",
-            base_url="https://api.anthropic.com",
-            api_mode="anthropic_messages",
+            base_url="http://127.0.0.1:4100/v1",
+            api_mode="chat_completions",
         )
 
 
@@ -64,9 +64,11 @@ def test_switch_drops_old_primary_from_fallback_chain():
     providers = [entry["provider"] for entry in agent._fallback_chain]
 
     assert "openrouter" not in providers, "old primary must be pruned"
-    assert "anthropic" not in providers, "new primary is redundant in the chain"
-    assert providers == ["nous"]
-    assert agent._fallback_model == {"provider": "nous", "model": "hermes-4"}
+    assert "claude-proxy" not in providers, "new primary is redundant in the chain"
+    # Claude is fail-closed: even otherwise-valid fallback entries are
+    # removed rather than used as an alternate provider.
+    assert providers == []
+    assert agent._fallback_model is None
 
 
 def test_switch_with_empty_chain_stays_empty():

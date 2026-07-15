@@ -1524,6 +1524,33 @@ def resolve_runtime_provider(
     behavior (api_mode derived from config).
     """
     requested_provider = resolve_requested_provider(requested)
+    model_cfg = _get_model_config()
+
+    # Claude/Anthropic is a policy-controlled OAuth CLI route.  Keep this
+    # before every native-provider, named-custom, and generic fallback branch:
+    # once a request is recognizably Claude, the resolver returns only the
+    # loopback mini-proxy runtime or raises a fail-closed policy error.
+    from hermes_cli.claude_route_policy import resolve_claude_proxy_runtime
+
+    claude_target_model = target_model
+    if claude_target_model is None:
+        claude_target_model = model_cfg.get("default")
+        # Named custom entries carry their own model field. Preserve that
+        # model while replacing only the endpoint/credential path; otherwise
+        # ``custom:claude`` would silently become the global model default.
+        if str(requested_provider or "").strip().casefold().startswith("custom:"):
+            named_custom = _get_named_custom_provider(requested_provider)
+            if named_custom and named_custom.get("model"):
+                claude_target_model = named_custom["model"]
+
+    claude_runtime = resolve_claude_proxy_runtime(
+        requested_provider=requested_provider,
+        target_model=claude_target_model,
+        explicit_base_url=explicit_base_url,
+        model_cfg=model_cfg,
+    )
+    if claude_runtime is not None:
+        return claude_runtime
 
     if requested_provider == "moa":
         return {
@@ -1563,7 +1590,7 @@ def resolve_runtime_provider(
     if requested_provider == "azure-foundry":
         azure_runtime = _resolve_azure_foundry_runtime(
             requested_provider=requested_provider,
-            model_cfg=_get_model_config(),
+            model_cfg=model_cfg,
             explicit_api_key=explicit_api_key,
             explicit_base_url=explicit_base_url,
             target_model=target_model,

@@ -71,6 +71,33 @@ class TestResolveRuntimeAgentKwargsAuthFallback:
             with pytest.raises(RuntimeError):
                 _resolve_runtime_agent_kwargs()
 
+    def test_claude_route_error_never_tries_fallback(self, tmp_path, monkeypatch):
+        """A Claude proxy policy failure cannot be converted to another provider."""
+        from hermes_cli.claude_route_policy import ClaudeRouteError
+
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            "model:\n"
+            "  provider: anthropic\n"
+            "  default: claude-fable-5\n"
+            "fallback_model:\n"
+            "  provider: openrouter\n"
+            "  model: meta-llama/llama-4-maverick\n"
+        )
+        monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+
+        with patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            side_effect=ClaudeRouteError("proxy route unavailable"),
+        ) as resolve, patch("gateway.run._try_resolve_fallback_provider") as fallback:
+            from gateway.run import _resolve_runtime_agent_kwargs
+
+            with pytest.raises(ClaudeRouteError):
+                _resolve_runtime_agent_kwargs()
+
+        assert resolve.call_count == 1
+        fallback.assert_not_called()
+
     def test_legacy_fallback_is_appended_after_fallback_providers(self, tmp_path, monkeypatch):
         """When both keys exist, the legacy entry still participates in resolution."""
         config_path = tmp_path / "config.yaml"

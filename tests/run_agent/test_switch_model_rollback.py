@@ -110,46 +110,34 @@ def test_openai_client_rebuild_failure_rolls_back_to_original_state():
     assert agent._client_kwargs == original_kwargs
 
 
-def test_anthropic_client_rebuild_failure_rolls_back_to_original_state():
-    """When build_anthropic_client raises, every mutated field must restore."""
-    agent = _make_agent_anthropic()
+def test_claude_proxy_rebuild_failure_rolls_back_to_original_state():
+    """A failed Claude-proxy rebuild restores the pre-switch runtime."""
+    agent = _make_agent_openrouter()
+    original_client = agent.client
+    original_kwargs = dict(agent._client_kwargs)
 
-    original_anthropic_client = agent._anthropic_client
-    original_anthropic_key = agent._anthropic_api_key
-    original_anthropic_base = agent._anthropic_base_url
+    def boom(*_a, **_kw):
+        raise RuntimeError("simulated Claude proxy build failure")
 
-    with (
-        patch(
-            "agent.anthropic_adapter.build_anthropic_client",
-            side_effect=RuntimeError("simulated anthropic build failure"),
-        ),
-        patch(
-            "agent.anthropic_adapter.resolve_anthropic_token",
-            return_value="sk-ant-resolved",
-        ),
-        patch("agent.anthropic_adapter._is_oauth_token", return_value=False),
-        patch("hermes_cli.timeouts.get_provider_request_timeout", return_value=None),
-    ):
-        with pytest.raises(RuntimeError, match="simulated anthropic build failure"):
+    agent._create_openai_client = boom
+
+    with patch("hermes_cli.timeouts.get_provider_request_timeout", return_value=None):
+        with pytest.raises(RuntimeError, match="simulated Claude proxy build failure"):
             agent.switch_model(
                 new_model="claude-opus-4-6",
-                new_provider="opencode-zen",
-                api_key="zen-key-new",
-                base_url="https://opencode.example/v1",
-                api_mode="anthropic_messages",
+                new_provider="anthropic",
+                api_key="ignored-api-key",
+                base_url="http://127.0.0.1:4100/v1",
+                api_mode="chat_completions",
             )
 
-    # Anthropic-specific state restored
-    assert agent._anthropic_client is original_anthropic_client
-    assert agent._anthropic_api_key == original_anthropic_key
-    assert agent._anthropic_base_url == original_anthropic_base
-
-    # Core state also restored
-    assert agent.model == "claude-sonnet-4-5"
-    assert agent.provider == "anthropic"
-    assert agent.base_url == "https://api.anthropic.com"
-    assert agent.api_mode == "anthropic_messages"
-    assert agent.api_key == "sk-ant-original"
+    assert agent.model == "x-ai/grok-4"
+    assert agent.provider == "openrouter"
+    assert agent.base_url == "https://openrouter.ai/api/v1"
+    assert agent.api_mode == "chat_completions"
+    assert agent.api_key == "or-key-original"
+    assert agent.client is original_client
+    assert agent._client_kwargs == original_kwargs
 
 
 def test_cross_branch_anthropic_to_openai_rebuild_failure_rolls_back():

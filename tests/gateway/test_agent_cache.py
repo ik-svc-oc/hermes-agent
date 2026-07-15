@@ -431,7 +431,7 @@ class TestAgentCacheLifecycle:
 
         # First message — create and cache
         agent1 = AIAgent(
-            model="anthropic/claude-sonnet-4", api_key="test",
+            model="gpt-4o-mini", api_key="test",
             base_url="https://openrouter.ai/api/v1", provider="openrouter",
             max_iterations=5, quiet_mode=True, skip_context_files=True,
             skip_memory=True, platform="telegram",
@@ -457,7 +457,7 @@ class TestAgentCacheLifecycle:
 
         old_sig = runner._agent_config_signature("anthropic/claude-sonnet-4", runtime, ["hermes-telegram"], "")
         agent1 = AIAgent(
-            model="anthropic/claude-sonnet-4", api_key="test",
+            model="gpt-4o-mini", api_key="test",
             base_url="https://openrouter.ai/api/v1", provider="openrouter",
             max_iterations=5, quiet_mode=True, skip_context_files=True,
             skip_memory=True, platform="telegram",
@@ -481,7 +481,7 @@ class TestAgentCacheLifecycle:
         session_key = "telegram:12345"
 
         agent = AIAgent(
-            model="anthropic/claude-sonnet-4", api_key="test",
+            model="gpt-4o-mini", api_key="test",
             base_url="https://openrouter.ai/api/v1", provider="openrouter",
             max_iterations=5, quiet_mode=True, skip_context_files=True,
             skip_memory=True,
@@ -512,7 +512,7 @@ class TestAgentCacheLifecycle:
         from run_agent import AIAgent
 
         agent = AIAgent(
-            model="anthropic/claude-sonnet-4", api_key="test",
+            model="gpt-4o-mini", api_key="test",
             base_url="https://openrouter.ai/api/v1", provider="openrouter",
             max_iterations=5, quiet_mode=True, skip_context_files=True,
             skip_memory=True,
@@ -535,7 +535,7 @@ class TestAgentCacheLifecycle:
         from run_agent import AIAgent
 
         agent = AIAgent(
-            model="anthropic/claude-sonnet-4", api_key="test",
+            model="gpt-4o-mini", api_key="test",
             base_url="https://openrouter.ai/api/v1", provider="openrouter",
             max_iterations=5, quiet_mode=True, skip_context_files=True,
             skip_memory=True, platform="telegram",
@@ -554,7 +554,7 @@ class TestAgentCacheLifecycle:
         from run_agent import AIAgent
 
         agent = AIAgent(
-            model="anthropic/claude-sonnet-4", api_key="test",
+            model="gpt-4o-mini", api_key="test",
             base_url="https://openrouter.ai/api/v1", provider="openrouter",
             max_iterations=5, quiet_mode=True, skip_context_files=True,
             skip_memory=True,
@@ -1206,7 +1206,7 @@ class TestAgentCacheSpilloverLive:
         """A genuine AIAgent; no API calls are made during these tests."""
         from run_agent import AIAgent
         return AIAgent(
-            model="anthropic/claude-sonnet-4", api_key="test",
+            model="gpt-4o-mini", api_key="test",
             base_url="https://openrouter.ai/api/v1", provider="openrouter",
             max_iterations=5, quiet_mode=True,
             skip_context_files=True, skip_memory=True,
@@ -1354,7 +1354,7 @@ class TestAgentCacheIdleResume:
         from run_agent import AIAgent
 
         agent = AIAgent(
-            model="anthropic/claude-sonnet-4", api_key="test",
+            model="gpt-4o-mini", api_key="test",
             base_url="https://openrouter.ai/api/v1", provider="openrouter",
             max_iterations=5, quiet_mode=True,
             skip_context_files=True, skip_memory=True,
@@ -1387,7 +1387,7 @@ class TestAgentCacheIdleResume:
         from tools import browser_tool as _bt
 
         agent = AIAgent(
-            model="anthropic/claude-sonnet-4", api_key="test",
+            model="gpt-4o-mini", api_key="test",
             base_url="https://openrouter.ai/api/v1", provider="openrouter",
             max_iterations=5, quiet_mode=True,
             skip_context_files=True, skip_memory=True,
@@ -1424,7 +1424,7 @@ class TestAgentCacheIdleResume:
         from run_agent import AIAgent
 
         agent = AIAgent(
-            model="anthropic/claude-sonnet-4", api_key="test",
+            model="gpt-4o-mini", api_key="test",
             base_url="https://openrouter.ai/api/v1", provider="openrouter",
             max_iterations=5, quiet_mode=True,
             skip_context_files=True, skip_memory=True,
@@ -1450,14 +1450,14 @@ class TestAgentCacheIdleResume:
         # Agent A: evicted from cache (soft) — terminal survives.
         # Agent B: session expired (hard) — terminal torn down.
         agent_a = AIAgent(
-            model="anthropic/claude-sonnet-4", api_key="test",
+            model="gpt-4o-mini", api_key="test",
             base_url="https://openrouter.ai/api/v1", provider="openrouter",
             max_iterations=5, quiet_mode=True,
             skip_context_files=True, skip_memory=True,
             session_id="soft-session",
         )
         agent_b = AIAgent(
-            model="anthropic/claude-sonnet-4", api_key="test",
+            model="gpt-4o-mini", api_key="test",
             base_url="https://openrouter.ai/api/v1", provider="openrouter",
             max_iterations=5, quiet_mode=True,
             skip_context_files=True, skip_memory=True,
@@ -1498,7 +1498,7 @@ class TestAgentCacheIdleResume:
         # Build an agent representing a stale (idle) session.
         SESSION_ID = "long-lived-user-session"
         old = AIAgent(
-            model="anthropic/claude-sonnet-4", api_key="test",
+            model="gpt-4o-mini", api_key="test",
             base_url="https://openrouter.ai/api/v1", provider="openrouter",
             max_iterations=5, quiet_mode=True,
             skip_context_files=True, skip_memory=True,
@@ -1520,7 +1520,7 @@ class TestAgentCacheIdleResume:
 
         # User comes back — new agent built for the SAME session_id.
         new_agent = AIAgent(
-            model="anthropic/claude-sonnet-4", api_key="test",
+            model="gpt-4o-mini", api_key="test",
             base_url="https://openrouter.ai/api/v1", provider="openrouter",
             max_iterations=5, quiet_mode=True,
             skip_context_files=True, skip_memory=True,

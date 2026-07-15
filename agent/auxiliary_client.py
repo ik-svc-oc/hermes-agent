@@ -1829,7 +1829,14 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
                     continue
             except ImportError:
                 pass
-            return _try_anthropic()
+            # Never call the native Anthropic helper from the auto chain.
+            # Resolve through the shared Claude policy so an explicitly
+            # configured Anthropic credential cannot become an API-key escape.
+            return resolve_provider_client(
+                "anthropic",
+                model=_get_aux_model_for_provider("anthropic")
+                or "claude-haiku-4-5-20251001",
+            )
 
         pool_present, entry = _select_pool_entry(provider_id)
         if pool_present:
@@ -2264,6 +2271,13 @@ def _resolve_custom_runtime() -> Tuple[Optional[str], Optional[str], Optional[st
 
         runtime = resolve_runtime_provider(requested="custom")
     except Exception as exc:
+        # A Claude route is fail-closed. Do not turn a missing proxy token,
+        # foreign endpoint, or malformed policy into an OPENAI_BASE_URL
+        # fallback that bypasses the OAuth mini-proxy.
+        from hermes_cli.claude_route_policy import ClaudeRouteError
+
+        if isinstance(exc, ClaudeRouteError):
+            raise
         logger.debug("Auxiliary client: custom runtime resolution failed: %s", exc)
         runtime = None
 
@@ -2366,6 +2380,25 @@ def _try_custom_endpoint() -> Tuple[Optional[Any], Optional[str]]:
     if custom_base.lower().startswith(_CODEX_AUX_BASE_URL.lower()):
         return None, None
     model = _read_main_model() or "gpt-4o-mini"
+    # Defense in depth for callers that reach this helper directly instead of
+    # going through resolve_provider_client(). A Claude model may use only the
+    # fixed OAuth mini-proxy; a foreign custom endpoint is rejected and never
+    # becomes an alternate fallback.
+    from hermes_cli.claude_route_policy import resolve_claude_proxy_runtime
+
+    claude_runtime = resolve_claude_proxy_runtime(
+        requested_provider="custom",
+        target_model=model,
+        explicit_base_url=custom_base,
+        model_cfg={},
+    )
+    if claude_runtime is not None:
+        proxy_model = str(claude_runtime.get("model") or model)
+        proxy_client = _create_openai_client(
+            api_key=str(claude_runtime["api_key"]),
+            base_url=str(claude_runtime["base_url"]),
+        )
+        return proxy_client, proxy_model
     logger.debug("Auxiliary client: custom endpoint (%s, api_mode=%s)", model, custom_mode or "chat_completions")
     _clean_base, _dq = _extract_url_query_params(custom_base)
     _extra = {"default_query": _dq} if _dq else {}
@@ -4456,6 +4489,49 @@ def resolve_provider_client(
     if not model and provider != "auto":
         model = _get_aux_model_for_provider(provider) or _read_main_model() or model
 
+    # Named custom providers can carry the only model declaration in the
+    # config.  Load that value before classification so a request such as
+    # ``providers.myrelay.default_model: claude-opus-4-7`` cannot enter the
+    # native ``anthropic_messages`` branch merely because the caller omitted
+    # the auxiliary model argument.
+    if not model and provider != "auto":
+        try:
+            from hermes_cli.runtime_provider import _get_named_custom_provider
+
+            for _candidate in (original_provider, provider):
+                _named_route_entry = _get_named_custom_provider(_candidate)
+                if _named_route_entry and _named_route_entry.get("model"):
+                    model = str(_named_route_entry["model"]).strip()
+                    break
+        except ImportError:
+            pass
+
+    # Claude/Anthropic auxiliary work is governed by the same locked OAuth
+    # mini-proxy as the main agent. This runs before provider-specific branches
+    # so an auxiliary caller cannot rebuild a native Anthropic client or fall
+    # through to an API-key provider.
+    from hermes_cli.claude_route_policy import resolve_claude_proxy_runtime
+
+    claude_runtime = resolve_claude_proxy_runtime(
+        requested_provider=provider,
+        target_model=model,
+        explicit_base_url=explicit_base_url,
+        model_cfg={},
+    )
+    if claude_runtime is not None:
+        final_model = model or claude_runtime.get("model")
+        if not final_model:
+            raise RuntimeError(
+                "Claude proxy route requires an explicit model; no default or fallback is permitted"
+            )
+        client = _create_openai_client(
+            api_key=str(claude_runtime["api_key"]),
+            base_url=str(claude_runtime["base_url"]),
+        )
+        if async_mode:
+            return _to_async_client(client, final_model, is_vision=is_vision)
+        return client, final_model
+
     def _needs_codex_wrap(client_obj, base_url_str: str, model_str: str) -> bool:
         """Decide if a plain OpenAI client should be wrapped for Responses API.
 
@@ -5037,19 +5113,44 @@ def resolve_provider_client(
                 else (client, final_model))
 
     elif pconfig.auth_type == "aws_sdk":
-        # AWS SDK providers (Bedrock) — Claude models use the Anthropic Bedrock
-        # SDK (prompt caching, thinking); non-Claude models use Converse API.
+        # AWS SDK providers (Bedrock) — non-Claude models use Converse API.
+        # Claude model IDs are intercepted by the locked OAuth mini-proxy below.
         try:
             from agent.bedrock_adapter import (
                 has_aws_credentials,
                 is_anthropic_bedrock_model,
                 resolve_bedrock_region,
             )
-            from agent.anthropic_adapter import build_anthropic_bedrock_client
         except ImportError:
             logger.warning("resolve_provider_client: bedrock requested but "
-                           "boto3 or anthropic SDK not installed")
+                           "boto3 not installed")
             return None, None
+
+        default_model = "anthropic.claude-haiku-4-5-20251001-v1:0"
+        final_model = _normalize_resolved_model(model or default_model, provider)
+
+        if is_anthropic_bedrock_model(final_model):
+            # Bedrock's own default is a Claude model, so the earlier
+            # provider/model gate cannot see it when callers omit ``model``.
+            # Re-run the locked policy after choosing the default and replace
+            # the AWS SDK path with the OAuth mini-proxy.
+            from hermes_cli.claude_route_policy import resolve_claude_proxy_runtime
+
+            claude_runtime = resolve_claude_proxy_runtime(
+                requested_provider=provider,
+                target_model=final_model,
+                model_cfg={},
+            )
+            proxy_model = str(claude_runtime.get("model") or final_model)
+            proxy_client = _create_openai_client(
+                api_key=str(claude_runtime["api_key"]),
+                base_url=str(claude_runtime["base_url"]),
+            )
+            return (
+                _to_async_client(proxy_client, proxy_model, is_vision=is_vision)
+                if async_mode
+                else (proxy_client, proxy_model)
+            )
 
         if not has_aws_credentials():
             logger.debug("resolve_provider_client: bedrock requested but "
@@ -5057,27 +5158,10 @@ def resolve_provider_client(
             return None, None
 
         region = resolve_bedrock_region()
-        default_model = "anthropic.claude-haiku-4-5-20251001-v1:0"
-        final_model = _normalize_resolved_model(model or default_model, provider)
-        base_url = f"https://bedrock-runtime.{region}.amazonaws.com"
 
-        if is_anthropic_bedrock_model(final_model):
-            try:
-                real_client = build_anthropic_bedrock_client(region)
-            except ImportError as exc:
-                logger.warning("resolve_provider_client: cannot create Bedrock "
-                               "client: %s", exc)
-                return None, None
-            client = AnthropicAuxiliaryClient(
-                real_client, final_model, api_key="aws-sdk",
-                base_url=base_url,
-            )
-            logger.debug("resolve_provider_client: bedrock anthropic (%s, %s)",
-                         final_model, region)
-        else:
-            client = BedrockAuxiliaryClient(region, final_model)
-            logger.debug("resolve_provider_client: bedrock converse (%s, %s)",
-                         final_model, region)
+        client = BedrockAuxiliaryClient(region, final_model)
+        logger.debug("resolve_provider_client: bedrock converse (%s, %s)",
+                     final_model, region)
 
         return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
                 else (client, final_model))
@@ -5212,9 +5296,20 @@ def _resolve_strict_vision_backend(
         # allow-list); callers must specify via auxiliary.<task>.model.
         return resolve_provider_client("openai-codex", model, is_vision=True)
     if provider == "anthropic":
-        return _try_anthropic()
+        # Vision's strict backend path must use the same locked proxy as text
+        # auxiliary work; it must not call the native Anthropic helper.
+        return resolve_provider_client(
+            "anthropic",
+            model=model or _get_aux_model_for_provider("anthropic")
+            or "claude-haiku-4-5-20251001",
+            is_vision=True,
+        )
     if provider == "custom":
-        return _try_custom_endpoint()
+        return resolve_provider_client(
+            "custom",
+            model=_read_main_model() or None,
+            is_vision=True,
+        )
     return None, None
 
 

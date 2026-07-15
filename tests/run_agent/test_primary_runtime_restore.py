@@ -83,8 +83,8 @@ class TestPrimaryRuntimeSnapshot:
         assert rt["compressor_context_length"] == cc.context_length
         assert rt["compressor_threshold_tokens"] == cc.threshold_tokens
 
-    def test_snapshot_includes_anthropic_state_when_applicable(self):
-        """Anthropic-mode agents should snapshot Anthropic-specific state."""
+    def test_snapshot_includes_locked_claude_proxy_state(self):
+        """Claude snapshots retain the proxy lock and no native endpoint."""
         with (
             patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("web_search")),
             patch("run_agent.check_toolset_requirements", return_value={}),
@@ -92,18 +92,19 @@ class TestPrimaryRuntimeSnapshot:
             patch("agent.anthropic_adapter.build_anthropic_client", return_value=MagicMock()),
         ):
             agent = AIAgent(
-                api_key="sk-ant-test-12345678",
-                base_url="https://api.anthropic.com",
+                api_key="ignored-api-key",
+                base_url="http://127.0.0.1:4100/v1",
                 provider="anthropic",
-                api_mode="anthropic_messages",
+                model="claude-sonnet-4-6",
                 quiet_mode=True,
                 skip_context_files=True,
                 skip_memory=True,
             )
         rt = agent._primary_runtime
-        assert "anthropic_api_key" in rt
-        assert "anthropic_base_url" in rt
-        assert "is_anthropic_oauth" in rt
+        assert rt["provider"] == "claude-proxy"
+        assert rt["base_url"] == "http://127.0.0.1:4100/v1"
+        assert rt["claude_proxy_locked"] is True
+        assert "anthropic_api_key" not in rt
 
     def test_snapshot_omits_anthropic_for_openai_mode(self):
         agent = _make_agent(provider="custom")
@@ -495,10 +496,12 @@ class TestTryRecoverPrimaryTransport:
         )
         assert result is False
 
-    def test_allowed_for_anthropic_direct(self):
-        """Direct Anthropic endpoint should get recovery."""
-        agent = _make_agent(provider="anthropic", base_url="https://api.anthropic.com")
-        # For non-anthropic_messages api_mode, it will use OpenAI client
+    def test_allowed_for_locked_claude_proxy(self):
+        """The fixed Claude proxy route still gets transport recovery."""
+        agent = _make_agent(
+            provider="anthropic",
+            base_url="http://127.0.0.1:4100/v1",
+        )
         error = _make_transport_error("ConnectError")
 
         with patch("run_agent.OpenAI", return_value=MagicMock()), \

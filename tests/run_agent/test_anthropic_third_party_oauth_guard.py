@@ -137,7 +137,7 @@ class TestOAuthFlagOnConstruction:
                 base_url="https://api.minimax.io/anthropic",
                 provider="minimax",
                 api_mode="anthropic_messages",
-                model="claude-sonnet-4-6",
+                model="MiniMax-M2.5",
                 quiet_mode=True,
                 skip_context_files=True,
                 skip_memory=True,

@@ -20,6 +20,7 @@ test runner at ``scripts/run_tests.sh``.
 """
 
 import asyncio
+import json
 import os
 import sys
 from pathlib import Path
@@ -446,6 +447,62 @@ def _hermetic_environment(tmp_path, monkeypatch):
     # the generic credential-shaped env-var filter above.
     monkeypatch.delenv("GMI_API_KEY", raising=False)
     monkeypatch.delenv("GMI_BASE_URL", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_claude_proxy_policy(tmp_path, monkeypatch):
+    """Keep locked-Claude tests away from the operator's live token.
+
+    Production code reads a durable absolute policy path. Tests should still
+    exercise that policy boundary, but with an owner-only temporary token and
+    a deterministic model map rather than the workstation credential.
+    """
+    token_path = tmp_path / "claude-proxy-token"
+    token_path.write_text("test-claude-proxy-token", encoding="utf-8")
+    token_path.chmod(0o600)
+    policy_path = tmp_path / "route-policy.json"
+    policy_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "provider": "claude-proxy",
+                "provider_aliases": ["claude-cli-proxy"],
+                "base_url": "http://127.0.0.1:4100/v1",
+                "token_file": str(token_path),
+                "default_model": "claude-sonnet-4-6",
+                "models": {
+                    "claude-fable-5": "fable",
+                    "anthropic/claude-fable-5": "fable",
+                    "fable": "fable",
+                    "claude-opus-4-8": "opus",
+                    "claude-opus-4.8": "opus",
+                    "anthropic/claude-opus-4-8": "opus",
+                    "claude-opus-4-7": "opus",
+                    "claude-opus-4.7": "opus",
+                    "claude-opus-4.6": "opus",
+                    "claude-opus-4-6": "opus",
+                    "claude-opus-4-20250514": "opus",
+                    "opus": "opus",
+                    "claude-sonnet-4": "sonnet",
+                    "anthropic/claude-sonnet-4": "sonnet",
+                    "claude-sonnet-4-6": "sonnet",
+                    "anthropic/claude-sonnet-4-6": "sonnet",
+                    "claude-sonnet-4.6": "sonnet",
+                    "anthropic/claude-sonnet-4.6": "sonnet",
+                    "claude-sonnet-4-5-20250929-v1:0": "sonnet",
+                    "claude-sonnet-4-20250514": "sonnet",
+                    "sonnet": "sonnet",
+                    "claude-haiku-4-5-20251001": "haiku",
+                    "claude-haiku-4-5-20251001-v1:0": "haiku",
+                    "haiku": "haiku",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    from hermes_cli import claude_route_policy
+
+    monkeypatch.setattr(claude_route_policy, "POLICY_PATH", policy_path)
 
 
 # Backward-compat alias — old tests reference this fixture name. Keep it

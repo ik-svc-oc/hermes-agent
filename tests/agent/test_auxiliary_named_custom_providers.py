@@ -338,9 +338,8 @@ class TestProvidersDictApiModeAnthropicMessages:
         assert entry is not None
         assert "api_mode" not in entry
 
-    def test_resolve_provider_client_returns_anthropic_client(self, tmp_path, monkeypatch):
-        """Named custom provider with api_mode=anthropic_messages must
-        route through AnthropicAuxiliaryClient."""
+    def test_resolve_provider_client_locks_claude_to_oauth_proxy(self, tmp_path, monkeypatch):
+        """A Claude model cannot use a named provider's Anthropic endpoint."""
         monkeypatch.setenv("MYRELAY_API_KEY", "sk-test")
         _write_config(tmp_path, {
             "providers": {
@@ -353,26 +352,22 @@ class TestProvidersDictApiModeAnthropicMessages:
                 },
             },
         })
-        from agent.auxiliary_client import (
-            resolve_provider_client,
-            AnthropicAuxiliaryClient,
-            AsyncAnthropicAuxiliaryClient,
-        )
+        from agent.auxiliary_client import resolve_provider_client
+        from openai import AsyncOpenAI, OpenAI
         sync_client, sync_model = resolve_provider_client("myrelay", async_mode=False)
-        assert isinstance(sync_client, AnthropicAuxiliaryClient), (
-            f"expected AnthropicAuxiliaryClient, got {type(sync_client).__name__}"
-        )
+        assert isinstance(sync_client, OpenAI)
+        assert str(sync_client.base_url).rstrip("/") == "http://127.0.0.1:4100/v1"
+        assert sync_client.api_key == "test-claude-proxy-token"
         assert sync_model == "claude-opus-4-7"
 
         async_client, async_model = resolve_provider_client("myrelay", async_mode=True)
-        assert isinstance(async_client, AsyncAnthropicAuxiliaryClient), (
-            f"expected AsyncAnthropicAuxiliaryClient, got {type(async_client).__name__}"
-        )
+        assert isinstance(async_client, AsyncOpenAI)
+        assert str(async_client.base_url).rstrip("/") == "http://127.0.0.1:4100/v1"
+        assert async_client.api_key == "test-claude-proxy-token"
         assert async_model == "claude-opus-4-7"
 
-    def test_aux_task_override_routes_named_provider_to_anthropic(self, tmp_path, monkeypatch):
-        """The full chain: auxiliary.<task>.provider: myrelay with
-        api_mode anthropic_messages must produce an Anthropic client."""
+    def test_aux_task_override_routes_named_claude_provider_to_proxy(self, tmp_path, monkeypatch):
+        """The full chain locks a Claude auxiliary override to the proxy."""
         monkeypatch.setenv("MYRELAY_API_KEY", "sk-test")
         _write_config(tmp_path, {
             "providers": {
@@ -392,18 +387,16 @@ class TestProvidersDictApiModeAnthropicMessages:
             },
             "model": {"provider": "openrouter", "default": "anthropic/claude-sonnet-4.6"},
         })
-        from agent.auxiliary_client import (
-            get_async_text_auxiliary_client,
-            get_text_auxiliary_client,
-            AnthropicAuxiliaryClient,
-            AsyncAnthropicAuxiliaryClient,
-        )
+        from agent.auxiliary_client import get_async_text_auxiliary_client, get_text_auxiliary_client
+        from openai import AsyncOpenAI, OpenAI
         async_client, async_model = get_async_text_auxiliary_client("compression")
-        assert isinstance(async_client, AsyncAnthropicAuxiliaryClient)
+        assert isinstance(async_client, AsyncOpenAI)
+        assert str(async_client.base_url).rstrip("/") == "http://127.0.0.1:4100/v1"
         assert async_model == "claude-sonnet-4.6"
 
         sync_client, sync_model = get_text_auxiliary_client("compression")
-        assert isinstance(sync_client, AnthropicAuxiliaryClient)
+        assert isinstance(sync_client, OpenAI)
+        assert str(sync_client.base_url).rstrip("/") == "http://127.0.0.1:4100/v1"
         assert sync_model == "claude-sonnet-4.6"
 
     def test_provider_without_api_mode_still_uses_openai(self, tmp_path):

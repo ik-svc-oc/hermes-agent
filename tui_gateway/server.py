@@ -4425,12 +4425,23 @@ def _resolve_runtime_with_fallback(
     ``fallback_model`` chain before giving up.
     """
     from hermes_cli.auth import AuthError
+    from hermes_cli.claude_route_policy import ClaudeRouteError, is_claude_route
     from hermes_cli.runtime_provider import resolve_runtime_provider
 
     kwargs = resolve_kwargs or {}
+    primary_is_claude = is_claude_route(
+        provider=kwargs.get("requested"),
+        model=kwargs.get("target_model") or kwargs.get("model"),
+        base_url=kwargs.get("explicit_base_url"),
+    )
     try:
         return resolve_runtime_provider(**kwargs)
+    except ClaudeRouteError:
+        # A locked Claude route is never converted into a different provider.
+        raise
     except AuthError as primary_exc:
+        if primary_is_claude:
+            raise
         fb_chain = _load_fallback_model() or []
         for entry in fb_chain:
             if not isinstance(entry, dict):
@@ -4440,6 +4451,8 @@ def _resolve_runtime_with_fallback(
                 continue
             try:
                 fb_kwargs: dict = {"requested": fb_provider}
+                if entry.get("model"):
+                    fb_kwargs["target_model"] = entry["model"]
                 if entry.get("base_url"):
                     fb_kwargs["explicit_base_url"] = entry["base_url"]
                 if entry.get("api_key"):
@@ -4453,6 +4466,8 @@ def _resolve_runtime_with_fallback(
                     fb_provider,
                 )
                 return runtime
+            except ClaudeRouteError:
+                raise
             except Exception:
                 continue
         raise

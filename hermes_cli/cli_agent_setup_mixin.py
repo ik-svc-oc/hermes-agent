@@ -34,6 +34,9 @@ class CLIAgentSetupMixin:
             resolve_runtime_provider,
             format_runtime_provider_error,
         )
+        from hermes_cli.claude_route_policy import (
+            ClaudeRouteError,
+        )
 
         _primary_exc = None
         runtime = None
@@ -42,6 +45,7 @@ class CLIAgentSetupMixin:
                 requested=self.requested_provider,
                 explicit_api_key=self._explicit_api_key,
                 explicit_base_url=self._explicit_base_url,
+                target_model=self.model,
             )
         except Exception as exc:
             _primary_exc = exc
@@ -49,7 +53,7 @@ class CLIAgentSetupMixin:
         # Primary provider auth failed — try fallback providers before giving up.
         if runtime is None and _primary_exc is not None:
             from hermes_cli.auth import AuthError
-            if isinstance(_primary_exc, AuthError):
+            if isinstance(_primary_exc, AuthError) and not isinstance(_primary_exc, ClaudeRouteError):
                 _fb_chain = self._fallback_model if isinstance(self._fallback_model, list) else []
                 for _fb in _fb_chain:
                     _fb_provider = (_fb.get("provider") or "").strip().lower()
@@ -57,7 +61,11 @@ class CLIAgentSetupMixin:
                     if not _fb_provider or not _fb_model:
                         continue
                     try:
-                        runtime = resolve_runtime_provider(requested=_fb_provider)
+                        runtime = resolve_runtime_provider(
+                            requested=_fb_provider,
+                            target_model=_fb_model,
+                            explicit_base_url=_fb.get("base_url"),
+                        )
                         logger.warning(
                             "Primary provider auth failed (%s). Falling through to fallback: %s/%s",
                             _primary_exc, _fb_provider, _fb_model,

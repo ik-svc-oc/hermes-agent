@@ -1,18 +1,8 @@
-"""Regression tests for OpenCode /v1 stripping during /model switch.
+"""Regression tests for provider-safe /model switching.
 
-When switching to an Anthropic-routed OpenCode model mid-session (e.g.
-``/model minimax-m2.7`` on opencode-go, or ``/model claude-sonnet-4-6``
-on opencode-zen), the resolved base_url must have its trailing ``/v1``
-stripped before being handed to the Anthropic SDK.
-
-Without the strip, the SDK prepends its own ``/v1/messages`` path and
-requests hit ``https://opencode.ai/zen/go/v1/v1/messages`` — a double
-``/v1`` that returns OpenCode's website 404 page with HTML body.
-
-``hermes_cli.runtime_provider.resolve_runtime_provider`` already strips
-``/v1`` at fresh agent init (PR #4918), but the ``/model`` mid-session
-switch path in ``hermes_cli.model_switch.switch_model`` was missing the
-same logic — these tests guard against that regression.
+OpenCode's non-Claude Anthropic models still need their historical ``/v1``
+normalization. Claude model names are now a separate locked route: the switch
+must land on the OAuth mini-proxy rather than OpenCode or native Anthropic.
 """
 
 from unittest.mock import patch
@@ -45,16 +35,29 @@ def _run_opencode_switch(
     from the session's current one.
     """
     effective_runtime_base = runtime_base_url or current_base_url
+
+    def _fake_runtime(*, requested=None, target_model=None, **_kwargs):
+        model_norm = (target_model or "").casefold()
+        if requested == "claude-proxy" or "claude" in model_norm or "anthropic" in model_norm:
+            return {
+                "provider": "claude-proxy",
+                "model": target_model or "claude-sonnet-4-6",
+                "api_key": "proxy-token",
+                "base_url": "http://127.0.0.1:4100/v1",
+                "api_mode": "chat_completions",
+            }
+        return {
+            "api_key": "sk-opencode-fake",
+            "base_url": effective_runtime_base,
+            "api_mode": "chat_completions",
+        }
+
     with (
         patch("hermes_cli.model_switch.resolve_alias", return_value=None),
         patch("hermes_cli.model_switch.list_provider_models", return_value=[]),
         patch(
             "hermes_cli.runtime_provider.resolve_runtime_provider",
-            return_value={
-                "api_key": "sk-opencode-fake",
-                "base_url": effective_runtime_base,
-                "api_mode": "chat_completions",
-            },
+            side_effect=_fake_runtime,
         ),
         patch(
             "hermes_cli.models.validate_requested_model",
@@ -148,10 +151,10 @@ class TestOpenCodeGoV1Strip:
 
 
 class TestOpenCodeZenV1Strip:
-    """OpenCode Zen: ``/model claude-*`` must strip /v1."""
+    """OpenCode Zen Claude names must move to the fixed OAuth mini-proxy."""
 
     def test_switch_to_claude_sonnet_strips_v1(self):
-        """Gemini → Claude on opencode-zen: /v1 stripped."""
+        """Gemini → Claude on opencode-zen cannot remain on OpenCode."""
         result = _run_opencode_switch(
             raw_input="claude-sonnet-4-6",
             current_provider="opencode-zen",
@@ -160,8 +163,9 @@ class TestOpenCodeZenV1Strip:
         )
 
         assert result.success
-        assert result.api_mode == "anthropic_messages"
-        assert result.base_url == "https://opencode.ai/zen"
+        assert result.target_provider == "claude-proxy"
+        assert result.api_mode == "chat_completions"
+        assert result.base_url == "http://127.0.0.1:4100/v1"
 
     def test_switch_to_gemini_leaves_v1_intact(self):
         """Gemini on opencode-zen stays on chat_completions with /v1."""
@@ -339,11 +343,7 @@ class TestStaleConfigDefaultDoesNotWedgeResolver:
         assert result.api_mode == "chat_completions"
 
     def test_claude_switch_still_strips_v1_with_kimi_config_default(self, tmp_path, monkeypatch):
-        """Inverse case: config default is chat_completions, switch TO anthropic_messages.
-
-        Guards that the target_model plumbing does not break the original
-        strip-for-anthropic behavior.
-        """
+        """A stale Kimi config cannot wedge Claude onto the OpenCode endpoint."""
         import yaml
         import importlib
 
@@ -371,5 +371,6 @@ class TestStaleConfigDefaultDoesNotWedgeResolver:
         )
 
         assert result.success, f"switch failed: {result.error_message}"
-        assert result.base_url == "https://opencode.ai/zen"
-        assert result.api_mode == "anthropic_messages"
+        assert result.target_provider == "claude-proxy"
+        assert result.base_url == "http://127.0.0.1:4100/v1"
+        assert result.api_mode == "chat_completions"

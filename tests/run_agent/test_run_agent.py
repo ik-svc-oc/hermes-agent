@@ -251,7 +251,7 @@ class TestProviderModelNormalization:
             patch("run_agent.OpenAI"),
         ):
             agent = AIAgent(
-                model="anthropic/claude-sonnet-4.6",
+                model="meta-llama/llama-3.3-70b-instruct",
                 provider="openrouter",
                 base_url="https://openrouter.ai/api/v1",
                 api_key="test-key-1234567890",
@@ -260,7 +260,7 @@ class TestProviderModelNormalization:
                 skip_memory=True,
             )
 
-        assert agent.model == "anthropic/claude-sonnet-4.6"
+        assert agent.model == "meta-llama/llama-3.3-70b-instruct"
 
 
 # ---------------------------------------------------------------------------
@@ -831,25 +831,22 @@ class TestMaskApiKey:
 
 
 class TestInit:
-    def test_anthropic_base_url_accepted(self):
-        """Anthropic base URLs should route to native Anthropic client."""
-        with (
-            patch("run_agent.get_tool_definitions", return_value=[]),
-            patch("run_agent.check_toolset_requirements", return_value={}),
-            patch("agent.anthropic_adapter._anthropic_sdk") as mock_anthropic,
-        ):
-            agent = AIAgent(
+    def test_anthropic_base_url_is_rejected(self):
+        """Native Anthropic endpoints cannot bypass the Claude mini-proxy."""
+        from hermes_cli.claude_route_policy import ClaudeRouteError
+
+        with pytest.raises(ClaudeRouteError, match="may use only"):
+            AIAgent(
                 api_key="test-key-1234567890",
                 base_url="https://api.anthropic.com/v1/",
+                model="claude-sonnet-4-6",
                 quiet_mode=True,
                 skip_context_files=True,
                 skip_memory=True,
             )
-            assert agent.api_mode == "anthropic_messages"
-            mock_anthropic.Anthropic.assert_called_once()
 
-    def test_prompt_caching_claude_openrouter(self):
-        """Claude model via OpenRouter should enable prompt caching."""
+    def test_prompt_caching_claude_openrouter_is_locked_to_proxy(self):
+        """Claude model via OpenRouter must use the proxy, not native caching."""
         with (
             patch("run_agent.get_tool_definitions", return_value=[]),
             patch("run_agent.check_toolset_requirements", return_value={}),
@@ -858,12 +855,14 @@ class TestInit:
             a = AIAgent(
                 api_key="test-k...7890",
                 model="anthropic/claude-sonnet-4-20250514",
-                base_url="https://openrouter.ai/api/v1",
+                base_url="http://127.0.0.1:4100/v1",
                 quiet_mode=True,
                 skip_context_files=True,
                 skip_memory=True,
             )
-            assert a._use_prompt_caching is True
+            assert a.provider == "claude-proxy"
+            assert a.base_url == "http://127.0.0.1:4100/v1"
+            assert a._use_prompt_caching is False
 
     def test_prompt_caching_non_claude(self):
         """Non-Claude model should disable prompt caching."""
@@ -875,7 +874,7 @@ class TestInit:
             a = AIAgent(
                 api_key="test-key-1234567890",
                 base_url="https://openrouter.ai/api/v1",
-                model="openai/gpt-4o",
+                model="llama-3.3-70b-instruct",
                 quiet_mode=True,
                 skip_context_files=True,
                 skip_memory=True,
@@ -891,7 +890,7 @@ class TestInit:
         ):
             a = AIAgent(
                 api_key="test-key-1234567890",
-                model="anthropic/claude-sonnet-4-20250514",
+                model="llama-3.3-70b-instruct",
                 base_url="http://localhost:8080/v1",
                 quiet_mode=True,
                 skip_context_files=True,
@@ -899,22 +898,19 @@ class TestInit:
             )
             assert a._use_prompt_caching is False
 
-    def test_prompt_caching_native_anthropic(self):
-        """Native Anthropic provider should enable prompt caching."""
-        with (
-            patch("run_agent.get_tool_definitions", return_value=[]),
-            patch("run_agent.check_toolset_requirements", return_value={}),
-            patch("agent.anthropic_adapter._anthropic_sdk"),
-        ):
-            a = AIAgent(
+    def test_prompt_caching_native_anthropic_is_not_available(self):
+        """The old native Anthropic cache path is intentionally unreachable."""
+        from hermes_cli.claude_route_policy import ClaudeRouteError
+
+        with pytest.raises(ClaudeRouteError):
+            AIAgent(
                 api_key="test-key-1234567890",
                 base_url="https://api.anthropic.com/v1/",
+                model="claude-sonnet-4-6",
                 quiet_mode=True,
                 skip_context_files=True,
                 skip_memory=True,
             )
-            assert a.api_mode == "anthropic_messages"
-            assert a._use_prompt_caching is True
 
     def test_prompt_caching_cache_ttl_defaults_without_config(self):
         """cache_ttl stays 5m when prompt_caching is absent from config."""
@@ -926,8 +922,8 @@ class TestInit:
         ):
             a = AIAgent(
                 api_key="test-k...7890",
-                model="anthropic/claude-sonnet-4-20250514",
-                base_url="https://openrouter.ai/api/v1",
+                model="claude-sonnet-4-20250514",
+                base_url="http://127.0.0.1:4100/v1",
                 quiet_mode=True,
                 skip_context_files=True,
                 skip_memory=True,
@@ -947,8 +943,8 @@ class TestInit:
         ):
             a = AIAgent(
                 api_key="test-k...7890",
-                model="anthropic/claude-sonnet-4-20250514",
-                base_url="https://openrouter.ai/api/v1",
+                model="claude-sonnet-4-20250514",
+                base_url="http://127.0.0.1:4100/v1",
                 quiet_mode=True,
                 skip_context_files=True,
                 skip_memory=True,
@@ -969,7 +965,7 @@ class TestInit:
             a = AIAgent(
                 api_key="test-k...7890",
                 provider="custom",
-                model="claude-opus-4-6-thinking",
+                model="llama-3.3-70b-instruct",
                 base_url="http://proxy.example/v1",
                 quiet_mode=True,
                 skip_context_files=True,
@@ -995,7 +991,7 @@ class TestInit:
             a = AIAgent(
                 api_key="test-k...7890",
                 provider="custom",
-                model="claude-opus-4-6-thinking",
+                model="llama-3.3-70b-instruct",
                 base_url="http://proxy.example/v1",
                 max_tokens=8192,
                 quiet_mode=True,
@@ -1018,7 +1014,7 @@ class TestInit:
         ):
             a = AIAgent(
                 api_key="test-k...7890",
-                model="anthropic/claude-sonnet-4-20250514",
+                model="openai/gpt-4o",
                 base_url="https://openrouter.ai/api/v1",
                 quiet_mode=True,
                 skip_context_files=True,
@@ -1353,7 +1349,11 @@ class TestToolUseEnforcementConfig:
             a = AIAgent(
                 model=model,
                 api_key="test-key-1234567890",
-                base_url="https://openrouter.ai/api/v1",
+                base_url=(
+                    "http://127.0.0.1:4100/v1"
+                    if "claude" in model.lower()
+                    else "https://openrouter.ai/api/v1"
+                ),
                 quiet_mode=True,
                 skip_context_files=True,
                 skip_memory=True,
@@ -1536,7 +1536,11 @@ class TestTaskCompletionGuidance:
             a = AIAgent(
                 model=model,
                 api_key="test-key-1234567890",
-                base_url="https://openrouter.ai/api/v1",
+                base_url=(
+                    "http://127.0.0.1:4100/v1"
+                    if "claude" in model.lower()
+                    else "https://openrouter.ai/api/v1"
+                ),
                 quiet_mode=True,
                 skip_context_files=True,
                 skip_memory=True,
@@ -1625,7 +1629,11 @@ class TestEnvironmentProbeIntegration:
             a = AIAgent(
                 model=model,
                 api_key="test-key-1234567890",
-                base_url="https://openrouter.ai/api/v1",
+                base_url=(
+                    "http://127.0.0.1:4100/v1"
+                    if "claude" in model.lower()
+                    else "https://openrouter.ai/api/v1"
+                ),
                 quiet_mode=True,
                 skip_context_files=True,
                 skip_memory=True,
